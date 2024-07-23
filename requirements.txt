@@ -1,0 +1,9 @@
+darshan~=3.4.4.0
+dispy~=4.15.2
+kaleido~=0.2.1
+matplotlib~=3.9.0rc2
+numpy~=1.26.4
+pandas~=2.2.2
+plotly~=5.21.0
+seaborn~=0.13.2
+scikit-learn~=1.4.2
