@@ -118,7 +118,7 @@ def create_categorizer_trace(segments: list, start: datetime, end: datetime, ope
     x_ts.append(end)
     y_amount.append(0)
 
-    return go.Scatter(x=x_ts, y=y_amount, mode='lines', name=f'{operation_type.capitalize()} Operations',
+    return go.Scatter(x=x_ts, y=y_amount, mode='lines', name=f'{operation_type.capitalize()} Operations from Periodicity Detection',
                       line=dict(color='blue' if operation_type == 'write' else 'red', width=3))
 
 
