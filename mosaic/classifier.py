@@ -198,3 +198,28 @@ def compute_amount_histogram(operations: dict, start: datetime, end: datetime) -
             [amount_histogram[0], amount_histogram[2]]),
         dtype=np.float64)) if amount_histogram[0] + amount_histogram[2] > 0 else 0
     return amount_histogram, cv_total, cv_before_end, cv_after_start, cv_start_and_end
+
+
+def generate_trace_vector(trace_data: dict, merged_operations: dict) -> str:
+    vect = ''
+    vect += f'{trace_data["infos"]["run_time"]},{trace_data["module"]["read_duration"]},{trace_data["module"]["write_duration"]},{trace_data["module"]["read_process_count"]},{trace_data["module"]["write_process_count"]},{trace_data["module"]["read_operations"]},{trace_data["module"]["write_operations"]},{trace_data["module"]["read_files"]},{trace_data["module"]["written_files"]},{trace_data["module"]["read"]},{trace_data["module"]["written"]}'
+    read_hist = compute_amount_histogram(load_operations(merged_operations['read']), merged_operations['infos']['start_ts'],
+                                         merged_operations['infos']['end_ts'])[0]
+    vect += f',{",".join(str(n / max(1, sum(read_hist))) for n in read_hist)}'
+    write_hist = compute_amount_histogram(load_operations(merged_operations['write']), merged_operations['infos']['start_ts'],
+                                          merged_operations['infos']['end_ts'])[0]
+    vect += f',{",".join(str(n / max(1, sum(write_hist))) for n in write_hist)}'
+    single_read_pattern_count = sum(
+        map(lambda p: p['segments_cnt'], filter(lambda p: p['segments_cnt'] == 1, merged_operations['read'])))
+    periodic_read_access_count = sum(
+        map(lambda p: p['segments_cnt'], filter(lambda p: p['segments_cnt'] != 1, merged_operations['read'])))
+    distinct_periodic_read_access_count = sum(p['segments_cnt'] != 1 for p in merged_operations['read'])
+    vect += f',{single_read_pattern_count},{periodic_read_access_count},{distinct_periodic_read_access_count}'
+    single_write_pattern_count = sum(
+        map(lambda p: p['segments_cnt'], filter(lambda p: p['segments_cnt'] == 1, merged_operations['write'])))
+    periodic_write_access_count = sum(
+        map(lambda p: p['segments_cnt'], filter(lambda p: p['segments_cnt'] != 1, merged_operations['write'])))
+    distinct_periodic_write_access_count = sum(p['segments_cnt'] != 1 for p in merged_operations['write'])
+    vect += f',{single_write_pattern_count},{periodic_write_access_count},{distinct_periodic_write_access_count}'
+    vect += f',{merged_operations["metadata"]["highest_spike"]},{merged_operations["metadata"]["spike_count"]},{merged_operations["metadata"]["operations_per_second"]}'
+    return vect

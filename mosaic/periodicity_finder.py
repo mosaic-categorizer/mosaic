@@ -17,6 +17,7 @@ def load_trace(report: DarshanReport, name: str, mount: str = '') -> dict:
     @param mount: PFS mounting point
     @return: dictionary containing all required information
     """
+    n_procs = report.metadata['job']['nprocs']
     trace = {'infos': get_job_infos(report, name)}
     if 'MPI-IO' in report.records.keys():
         module = 'MPIIO'
@@ -31,6 +32,9 @@ def load_trace(report: DarshanReport, name: str, mount: str = '') -> dict:
     module_df = pd.merge(report.records['MPI-IO' if module == 'MPIIO' else module].to_df()['counters'],
                          report.records['MPI-IO' if module == 'MPIIO' else module].to_df()['fcounters'],
                          left_on=['id', 'rank'], right_on=['id', 'rank'], how="inner", validate="many_to_many")
+    module_df['FILENAME'] = module_df['id'].apply(lambda i: report.name_records[i])
+    module_df = module_df[module_df['FILENAME'].str.startswith(mount)]
+    module_df['RANKS_INVOLVED'] = module_df['rank'].apply(lambda n: n_procs if n == -1 else 1)
 
     if module == 'MPIIO':
         posix_df_c = report.records['POSIX'].to_df()['counters']
@@ -45,10 +49,9 @@ def load_trace(report: DarshanReport, name: str, mount: str = '') -> dict:
     trace['access'] = []
 
     for index in module_df.index:
-        if report.name_records[module_df['id'][index]].startswith(mount):
-            trace['access'].append(
-                parse_access(module_df, module, index, posix_df_c, report.name_records[module_df['id'][index]],
-                             trace['infos']['nprocs'], trace['infos']['start_ts']))
+        trace['access'].append(
+            parse_access(module_df, module, index, posix_df_c, module_df['FILENAME'][index], trace['infos']['nprocs'],
+                         trace['infos']['start_ts']))
 
     trace['access'] = sort_accesses(trace['access'])
 
@@ -60,7 +63,7 @@ def load_trace(report: DarshanReport, name: str, mount: str = '') -> dict:
         return max(operation['read_end_ts'], operation['write_end_ts'])
 
     trace['infos']['end_ts'] = max(trace['infos']['end_ts'],
-                                 max(map(get_end_ts, trace['access']), default=trace['infos']['end_ts']))
+                                   max(map(get_end_ts, trace['access']), default=trace['infos']['end_ts']))
 
     return trace
 
@@ -101,12 +104,19 @@ def get_module_stats(module_df: pd.DataFrame, module: str, report: DarshanReport
         report.records['POSIX'].to_df()['counters']['POSIX_OPENS'].sum(),
         'seeks': module_df[f'{module}_SEEKS'].sum() if module != 'MPIIO' else
         report.records['POSIX'].to_df()['counters']['POSIX_SEEKS'].sum(),
-        'read_process_count': report.metadata['job']['nprocs'] if -1 in pd.unique(
-            (module_df.loc[module_df[f'{module}_BYTES_READ'] != 0])['rank']) else len(
-            pd.unique((module_df.loc[module_df[f'{module}_BYTES_READ'] != 0])['rank'])),
-        'write_process_count': report.metadata['job']['nprocs'] if -1 in pd.unique(
-            (module_df.loc[module_df[f'{module}_BYTES_WRITTEN'] != 0])['rank']) else len(
-            pd.unique((module_df.loc[module_df[f'{module}_BYTES_WRITTEN'] != 0])['rank']))
+        'read_process_count': report.metadata['job']['nprocs'] if -1 in
+                                                                  module_df[module_df[f'{module}_BYTES_READ'] != 0][
+                                                                      'rank'] else
+        module_df[module_df[f'{module}_BYTES_READ'] != 0]['rank'].nunique(),
+        'write_process_count': report.metadata['job']['nprocs'] if -1 in module_df[
+            module_df[f'{module}_BYTES_WRITTEN'] != 0]['rank'] else
+        module_df[module_df[f'{module}_BYTES_WRITTEN'] != 0]['rank'].nunique(),
+        'read_duration': module_df[f'{module}_F_READ_TIME'].sum(),
+        'write_duration': module_df[f'{module}_F_WRITE_TIME'].sum(),
+        'read_operations': module_df[module_df[f'{module}_BYTES_READ'] != 0]['RANKS_INVOLVED'].sum(),
+        'write_operations': module_df[module_df[f'{module}_BYTES_WRITTEN'] != 0]['RANKS_INVOLVED'].sum(),
+        'read_files': module_df[module_df[f'{module}_BYTES_READ'] != 0]['FILENAME'].nunique(),
+        'written_files': module_df[module_df[f'{module}_BYTES_WRITTEN'] != 0]['FILENAME'].nunique()
     }
 
 
@@ -138,18 +148,20 @@ def parse_access(module_df: pd.DataFrame, module_name: str, index: int, posix_df
         'read': module_df[f'{module_name}_BYTES_READ'][index],
         'read_duration': module_df[f'{module_name}_F_READ_END_TIMESTAMP'][index] -
                          module_df[f'{module_name}_F_READ_START_TIMESTAMP'][index],
-        'read_speed': 0 if module_df[f'{module_name}_BYTES_READ'][index] == 0 else module_df[f'{module_name}_BYTES_READ'][
-                                                                                  index] / (module_df[
-                                                                                                f'{module_name}_F_READ_END_TIMESTAMP'][
-                                                                                                index] - module_df[
-                                                                                                f'{module_name}_F_READ_START_TIMESTAMP'][
-                                                                                                index]),
+        'read_speed': 0 if module_df[f'{module_name}_BYTES_READ'][index] == 0 else
+        module_df[f'{module_name}_BYTES_READ'][
+            index] / (module_df[
+                          f'{module_name}_F_READ_END_TIMESTAMP'][
+                          index] - module_df[
+                          f'{module_name}_F_READ_START_TIMESTAMP'][
+                          index]),
         'read_start_ts': start_ts + timedelta(
-            seconds=module_df[f'{module_name}_F_READ_START_TIMESTAMP'][index]) if module_df[f'{module_name}_BYTES_READ'][
-                                                                                 index] != 0 else 0,
+            seconds=module_df[f'{module_name}_F_READ_START_TIMESTAMP'][index]) if
+        module_df[f'{module_name}_BYTES_READ'][
+            index] != 0 else 0,
         'read_end_ts': start_ts + timedelta(
             seconds=module_df[f'{module_name}_F_READ_END_TIMESTAMP'][index]) if module_df[f'{module_name}_BYTES_READ'][
-                                                                               index] != 0 else 0,
+                                                                                    index] != 0 else 0,
         'written': module_df[f'{module_name}_BYTES_WRITTEN'][index],
         'write_duration': module_df[f'{module_name}_F_WRITE_END_TIMESTAMP'][index] -
                           module_df[f'{module_name}_F_WRITE_START_TIMESTAMP'][index],
@@ -157,11 +169,13 @@ def parse_access(module_df: pd.DataFrame, module_name: str, index: int, posix_df
         module_df[f'{module_name}_BYTES_WRITTEN'][index] / (module_df[f'{module_name}_F_WRITE_END_TIMESTAMP'][index] -
                                                             module_df[f'{module_name}_F_WRITE_START_TIMESTAMP'][index]),
         'write_start_ts': start_ts + timedelta(
-            seconds=module_df[f'{module_name}_F_WRITE_START_TIMESTAMP'][index]) if module_df[f'{module_name}_BYTES_WRITTEN'][
-                                                                                  index] != 0 else 0,
+            seconds=module_df[f'{module_name}_F_WRITE_START_TIMESTAMP'][index]) if
+        module_df[f'{module_name}_BYTES_WRITTEN'][
+            index] != 0 else 0,
         'write_end_ts': start_ts + timedelta(
-            seconds=module_df[f'{module_name}_F_WRITE_END_TIMESTAMP'][index]) if module_df[f'{module_name}_BYTES_WRITTEN'][
-                                                                                index] != 0 else 0,
+            seconds=module_df[f'{module_name}_F_WRITE_END_TIMESTAMP'][index]) if
+        module_df[f'{module_name}_BYTES_WRITTEN'][
+            index] != 0 else 0,
     }
 
 
@@ -171,6 +185,7 @@ def sort_accesses(accesses: list) -> list:
     @param accesses: list of all accesses
     @return: chronologically ordered list of accesses
     """
+
     def get_start_ts(operation: dict) -> datetime:
         if operation['read'] == 0:
             return operation['write_start_ts']

@@ -2,7 +2,6 @@ import json
 import os
 import random
 import signal
-import sys
 import time
 from copy import copy
 
@@ -12,6 +11,7 @@ import pandas as pd
 import seaborn as sns
 from darshan.report import DarshanReport
 
+from mosaic.classifier import generate_trace_vector
 from mosaic.trace_extractor import extract_traces
 
 kill_switch, save_switch = False, False
@@ -21,7 +21,7 @@ class Categorizer:
 
     def __init__(self, trace_directory: str = 'none', output_directory: str = './out',
                  output_directory_graphs: str = 'graph', prune_inside_job: bool = False, mount: str = '/',
-                 archives_directory: str = '', remove_unreadable_jobs: bool = True, prune_executions: bool = True,
+                 archives_directory: str = '', remove_unreadable_traces: bool = True, prune_executions: bool = True,
                  dispy_nodes: str = 'localhost', remove_done: bool = True, load_from_pickle: bool = False):
         """
         @param trace_directory: directory where .darshan or .darshan.pkl.bz2 files are located (default: 'none')
@@ -30,7 +30,7 @@ class Categorizer:
         @param prune_inside_job: if multiple traces are from the same job, only keep one (default: False)
         @param mount: mounting point of PFS in darshan traces (default: /)
         @param archives_directory: directory where .tar files containing darshan files are located; if non-empty, archives will be extraced (default: '')
-        @param remove_unreadable_jobs: remove unreadable traces (default: True)
+        @param remove_unreadable_traces: remove unreadable traces (default: True)
         @param prune_executions: only keep one execution for each application (default: True)
         @param dispy_nodes: address of dispy nodes (default: 'localhost'); can be an array of str
         @param remove_done: remove traces already processed (default: True)
@@ -53,7 +53,7 @@ class Categorizer:
         self.load_from_pickle = load_from_pickle
 
         if archives_directory != '':
-            extract_traces(archives_directory, trace_directory, remove_unreadable_jobs)
+            extract_traces(archives_directory, trace_directory, remove_unreadable_traces)
         self.load_stats_json()
         if not os.path.exists(output_directory):
             os.makedirs(output_directory)
@@ -63,7 +63,7 @@ class Categorizer:
         if self.trace_directory == 'none':
             return
 
-        self.enumerate_jobs()
+        self.enumerate_jobs(remove_unreadable_traces)
         print(f'Found {len(self.jobs)} jobs')
 
         if load_from_pickle:
@@ -77,32 +77,12 @@ class Categorizer:
             self.prune_inside_jobs()
         self.trace_number = sum(map(lambda l: len(l), self.jobs.values()))
         print(f'Selected {self.trace_number} traces to analyze')
-        if remove_unreadable_jobs:
-            self.prune_unreadable_jobs()
         self.traces = [trace for ll in self.jobs.values() for trace in ll]
         if prune_executions:
             self.find_unique_applications()
         self.traces_to_process = copy(self.traces)
         if remove_done and 'processed' in self.trace_stats:
             self.remove_processed_traces()
-
-    def prune_unreadable_jobs(self) -> None:
-        """
-        Removes all jobs that cannot be loaded
-        """
-        if 'removed_traces' in self.trace_stats.keys():
-            print('Traces are already pruned')
-        else:
-            readable = self.find_readable_jobs()
-            print(
-                f'Can analyze {len(readable)} readable jobs '
-                f'({"{:.2f}".format(len(readable) / len(self.jobs) * 100)})% of total jobs')
-            jobs = set(self.jobs.keys())
-            for job in jobs:
-                if job not in readable:
-                    del self.jobs[job]
-            if len(readable) == len(self.jobs):
-                self.trace_stats['removed_traces'] = []
 
     def find_unique_applications(self) -> None:
         """
@@ -128,9 +108,11 @@ class Categorizer:
         purged = 0
         for trace in traces:
             if self.get_trace_hash(trace) in self.trace_stats['processed']:
-                self.traces_to_process.remove(trace)
-                self.recovered_results.append((trace, self.recover_classifier_result(trace)))
-                purged += 1
+                trace_file_path = os.path.join(self.output_directory, trace + '.json')
+                if os.path.isfile(trace_file_path):
+                    self.traces_to_process.remove(trace)
+                    self.recovered_results.append((trace, self.recover_classifier_result(trace)))
+                    purged += 1
         print(f'Removed {purged} already processed traces')
 
     def load_stats_json(self) -> None:
@@ -142,7 +124,7 @@ class Categorizer:
             with open(trace_file, 'r') as json_file:
                 self.trace_stats = json.load(json_file)
 
-    def enumerate_jobs(self) -> None:
+    def enumerate_jobs(self, remove_unreadable_traces: bool) -> None:
         """
         Find all job ids from dataset
         """
@@ -153,7 +135,11 @@ class Categorizer:
             traces = [file for file in files if file.endswith('.darshan.pkl.bz2')]
         else:
             traces = [file for file in files if file.endswith('.darshan')]
-        for trace in traces:
+        traces_tmp = copy(traces)
+        for trace in traces_tmp:
+            if not self.load_from_pickle and remove_unreadable_traces and not self.is_readable(trace):
+                traces.remove(trace)
+                continue
             job_id = trace.split('_')[-3]
             if job_id in self.jobs.keys():
                 self.jobs[job_id].append(trace)
@@ -202,36 +188,17 @@ class Categorizer:
                 if trace != trace_to_keep:
                     self.traces.remove(trace)
 
-    def find_readable_jobs(self) -> set:
-        """
-        Find all files that can be loaded by PyDarshan
-        @return: a set of all the readable traces
-        """
-        readable = set()
-        print('Finding readable jobs:')
-        i = 1
-        for job in self.jobs.keys():
-            sys.stdout.write(f'\r   Processing {i}/{len(self.jobs.keys())} jobs')
-            sys.stdout.flush()
-            i += 1
-            if self.is_readable(job):
-                readable.add(job)
-        sys.stdout.write('\r   Done\n')
-        sys.stdout.flush()
-        return readable
-
-    def is_readable(self, job: str) -> bool:
+    def is_readable(self, trace: str) -> bool:
         """
         Tell if all traces from a job are readable
-        @param job: job to analyze
+        @param trace: trace to test
         @return: True if all traces from job are readable, False otherwise
         """
-        for trace in self.jobs[job]:
-            try:
-                DarshanReport(os.path.join(self.trace_directory, trace), read_all=False)
-            except RuntimeError as _:
-                return False
-        return True
+        try:
+            DarshanReport(os.path.join(self.trace_directory, trace), read_all=False)
+            return True
+        except RuntimeError as _:
+            return False
 
     def categorize_trace(self, trace: str) -> None:
         """
@@ -697,7 +664,7 @@ def categorize_dispy(trace: str, trace_directory: str, output_directory: str, ou
         import _pickle as cpickle
         from darshan import DarshanReport
         import json
-        from mosaic.classifier import classify_trace
+        from mosaic.classifier import classify_trace, generate_trace_vector
         from mosaic.periodicity_finder import load_trace
         from mosaic.periodicity_finder import compute_metadata_stats, find_periodic_patterns
         from mosaic.serializer import serialize_dict
@@ -717,13 +684,14 @@ def categorize_dispy(trace: str, trace_directory: str, output_directory: str, ou
                   'write': write_segments}
         classes = classify_trace(result, len(read_segments) > 0, len(write_segments) > 0)
         result['classes'] = classes
+        result['infos']['vector'] = generate_trace_vector(job, result)
         if len(write_segments) > 0 or len(read_segments) > 0:
             visualize(write_job, write_segments, classes['write_classes'], read_job, read_segments,
                       classes['read_classes'], output_directory_graphs, mount)
         with open(os.path.join(output_directory, trace + '.json'), "w") as file:
             json.dump(serialize_dict(result), file, indent=4)
     except Exception as e:
-        print(' Error extracting patterns of trace', trace, e)
+        print(' Error extracting patterns of trace', trace, e, file=sys.stderr)
         return f'failed: {e}', []
     return trace, [class_list for category in classes.values() for class_list in category]
 
