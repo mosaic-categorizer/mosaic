@@ -1,199 +1,10 @@
+import os
 import statistics
 from collections import Counter
 from copy import copy
-from datetime import datetime, timedelta
 
 import numpy as np
-import pandas as pd
-from darshan.report import DarshanReport
 from sklearn.cluster import MeanShift, estimate_bandwidth
-
-
-def load_trace(report: DarshanReport, name: str, mount: str = '') -> dict:
-    """
-    Load a darshan trace in a dictionary with all information needed
-    @param report: DarshanReport object
-    @param name: trace name
-    @param mount: PFS mounting point
-    @return: dictionary containing all required information
-    """
-    n_procs = report.metadata['job']['nprocs']
-    trace = {'infos': get_job_infos(report, name)}
-    if 'MPI-IO' in report.records.keys():
-        module = 'MPIIO'
-    elif 'POSIX' in report.records.keys():
-        module = 'POSIX'
-    elif 'STDIO' in report.records.keys():
-        module = 'STDIO'
-    else:
-        raise RuntimeError(
-            f'Application did not use MPI-IO, POSIX or STDIO, available modules: {", ".join(report.records.keys())}')
-
-    module_df = pd.merge(report.records['MPI-IO' if module == 'MPIIO' else module].to_df()['counters'],
-                         report.records['MPI-IO' if module == 'MPIIO' else module].to_df()['fcounters'],
-                         left_on=['id', 'rank'], right_on=['id', 'rank'], how="inner", validate="many_to_many")
-    module_df['FILENAME'] = module_df['id'].apply(lambda i: report.name_records[i])
-    module_df = module_df[module_df['FILENAME'].str.startswith(mount)]
-    module_df['RANKS_INVOLVED'] = module_df['rank'].apply(lambda n: n_procs if n == -1 else 1)
-
-    if module == 'MPIIO':
-        posix_df_c = report.records['POSIX'].to_df()['counters']
-    else:
-        posix_df_c = None
-
-    # check if some columns contains negative numbers even if it should not be possible
-    if module_df[[f'{module}_BYTES_READ', f'{module}_BYTES_WRITTEN']].lt(0).any().any():
-        raise RuntimeError('Darshan trace is inconsistent (contains negative numbers where it should not).')
-
-    trace['module'] = get_module_stats(module_df, module, report)
-    trace['access'] = []
-
-    for index in module_df.index:
-        trace['access'].append(
-            parse_access(module_df, module, index, posix_df_c, module_df['FILENAME'][index], trace['infos']['nprocs'],
-                         trace['infos']['start_ts']))
-
-    trace['access'] = sort_accesses(trace['access'])
-
-    def get_end_ts(operation: dict) -> datetime:
-        if operation['read'] == 0:
-            return operation['write_end_ts']
-        if operation['written'] == 0:
-            return operation['read_end_ts']
-        return max(operation['read_end_ts'], operation['write_end_ts'])
-
-    trace['infos']['end_ts'] = max(trace['infos']['end_ts'],
-                                   max(map(get_end_ts, trace['access']), default=trace['infos']['end_ts']))
-
-    return trace
-
-
-def get_job_infos(report: DarshanReport, name: str) -> dict:
-    """
-    Load job information from trace
-    @param report: report object
-    @param name: trace name
-    @return: dictionary of job information
-    """
-    return {
-        'file': name,
-        'uid': report.metadata['job']['uid'],
-        'job_id': report.metadata['job']['jobid'],
-        'start_ts': datetime.fromtimestamp(
-            report.metadata['job']['start_time_sec'] + report.metadata['job']['start_time_nsec'] / 1e9),
-        'end_ts': datetime.fromtimestamp(
-            report.metadata['job']['end_time_sec'] + report.metadata['job']['end_time_nsec'] / 1e9),
-        'run_time': report.metadata['job']['run_time'],
-        'exe': report.metadata['exe'],
-        'nprocs': report.metadata['job']['nprocs']
-    }
-
-
-def get_module_stats(module_df: pd.DataFrame, module: str, report: DarshanReport) -> dict:
-    """
-    Load module global information
-    @param module_df: dataframe representation of the module
-    @param module: module name
-    @param report: report object
-    @return: dictionary of module information
-    """
-    return {
-        'read': module_df[f'{module}_BYTES_READ'].sum(),
-        'written': module_df[f'{module}_BYTES_WRITTEN'].sum(),
-        'opens': module_df[f'{module}_OPENS'].sum() if module != 'MPIIO' else
-        report.records['POSIX'].to_df()['counters']['POSIX_OPENS'].sum(),
-        'seeks': module_df[f'{module}_SEEKS'].sum() if module != 'MPIIO' else
-        report.records['POSIX'].to_df()['counters']['POSIX_SEEKS'].sum(),
-        'read_process_count': report.metadata['job']['nprocs'] if -1 in
-                                                                  module_df[module_df[f'{module}_BYTES_READ'] != 0][
-                                                                      'rank'] else
-        module_df[module_df[f'{module}_BYTES_READ'] != 0]['rank'].nunique(),
-        'write_process_count': report.metadata['job']['nprocs'] if -1 in module_df[
-            module_df[f'{module}_BYTES_WRITTEN'] != 0]['rank'] else
-        module_df[module_df[f'{module}_BYTES_WRITTEN'] != 0]['rank'].nunique(),
-        'read_duration': module_df[f'{module}_F_READ_TIME'].sum(),
-        'write_duration': module_df[f'{module}_F_WRITE_TIME'].sum(),
-        'read_operations': module_df[module_df[f'{module}_BYTES_READ'] != 0]['RANKS_INVOLVED'].sum(),
-        'write_operations': module_df[module_df[f'{module}_BYTES_WRITTEN'] != 0]['RANKS_INVOLVED'].sum(),
-        'read_files': module_df[module_df[f'{module}_BYTES_READ'] != 0]['FILENAME'].nunique(),
-        'written_files': module_df[module_df[f'{module}_BYTES_WRITTEN'] != 0]['FILENAME'].nunique()
-    }
-
-
-def parse_access(module_df: pd.DataFrame, module_name: str, index: int, posix_df: pd.DataFrame, file: str, nprocs: int,
-                 start_ts: datetime) -> dict:
-    """
-    Parse an operation from module dataframe
-    @param module_df: module dataframe
-    @param module_name: module name
-    @param index: operation index in DF
-    @param posix_df: posix dataframe for metadata information
-    @param file: accessed file
-    @param nprocs: number of job's processors
-    @param start_ts: job's start time
-    @return: dictionary representation of the operation
-    """
-    return {
-        'id': module_df['id'][index],
-        'file': file,
-        'rank': module_df['rank'][index],
-        'opens': module_df[f'{module_name}_OPENS'][index] if module_name != 'MPIIO' else posix_df['POSIX_OPENS'][index],
-        'seeks': module_df[f'{module_name}_SEEKS'][index] if module_name != 'MPIIO' else posix_df['POSIX_SEEKS'][index],
-        'read_total_duration': (nprocs if module_df['rank'][index] == -1 else 1) * (
-                module_df[f'{module_name}_F_READ_END_TIMESTAMP'][index] -
-                module_df[f'{module_name}_F_READ_START_TIMESTAMP'][index]),
-        'write_total_duration': (nprocs if module_df['rank'][index] == -1 else 1) * (
-                module_df[f'{module_name}_F_WRITE_END_TIMESTAMP'][index] -
-                module_df[f'{module_name}_F_WRITE_START_TIMESTAMP'][index]),
-        'read': module_df[f'{module_name}_BYTES_READ'][index],
-        'read_duration': module_df[f'{module_name}_F_READ_END_TIMESTAMP'][index] -
-                         module_df[f'{module_name}_F_READ_START_TIMESTAMP'][index],
-        'read_speed': 0 if module_df[f'{module_name}_BYTES_READ'][index] == 0 else
-        module_df[f'{module_name}_BYTES_READ'][
-            index] / (module_df[
-                          f'{module_name}_F_READ_END_TIMESTAMP'][
-                          index] - module_df[
-                          f'{module_name}_F_READ_START_TIMESTAMP'][
-                          index]),
-        'read_start_ts': start_ts + timedelta(
-            seconds=module_df[f'{module_name}_F_READ_START_TIMESTAMP'][index]) if
-        module_df[f'{module_name}_BYTES_READ'][
-            index] != 0 else 0,
-        'read_end_ts': start_ts + timedelta(
-            seconds=module_df[f'{module_name}_F_READ_END_TIMESTAMP'][index]) if module_df[f'{module_name}_BYTES_READ'][
-                                                                                    index] != 0 else 0,
-        'written': module_df[f'{module_name}_BYTES_WRITTEN'][index],
-        'write_duration': module_df[f'{module_name}_F_WRITE_END_TIMESTAMP'][index] -
-                          module_df[f'{module_name}_F_WRITE_START_TIMESTAMP'][index],
-        'write_speed': 0 if module_df[f'{module_name}_BYTES_WRITTEN'][index] == 0 else
-        module_df[f'{module_name}_BYTES_WRITTEN'][index] / (module_df[f'{module_name}_F_WRITE_END_TIMESTAMP'][index] -
-                                                            module_df[f'{module_name}_F_WRITE_START_TIMESTAMP'][index]),
-        'write_start_ts': start_ts + timedelta(
-            seconds=module_df[f'{module_name}_F_WRITE_START_TIMESTAMP'][index]) if
-        module_df[f'{module_name}_BYTES_WRITTEN'][
-            index] != 0 else 0,
-        'write_end_ts': start_ts + timedelta(
-            seconds=module_df[f'{module_name}_F_WRITE_END_TIMESTAMP'][index]) if
-        module_df[f'{module_name}_BYTES_WRITTEN'][
-            index] != 0 else 0,
-    }
-
-
-def sort_accesses(accesses: list) -> list:
-    """
-    Sort accesses chronologically
-    @param accesses: list of all accesses
-    @return: chronologically ordered list of accesses
-    """
-
-    def get_start_ts(operation: dict) -> datetime:
-        if operation['read'] == 0:
-            return operation['write_start_ts']
-        if operation['written'] == 0:
-            return operation['read_start_ts']
-        return min(operation['read_start_ts'], operation['write_start_ts'])
-
-    return sorted(filter(lambda x: x['read'] != 0 or x['written'] != 0, accesses), key=get_start_ts)
 
 
 def clusterize(durations: list, amounts: np.array) -> list:
@@ -246,48 +57,44 @@ def get_segments_of_label(labels: list, segments: list, target_label: int) -> li
     return res
 
 
-def segment_characterization(operations_per_segment: dict, segments: list, operation_type: str) -> dict:
+def segment_characterization(operations_per_segment: dict, segments: list) -> dict:
     """
     Characterize a group of segments
     @param operations_per_segment: dictionary of operations contained in each segment
     @param segments: list of segments in a group
-    @param operation_type: type of operation to characterize (read/write)
-    @return: dictionary with metrics about characterised segment group
+    @return: dictionary with metrics about characterized segment group
     """
     start_ts = segments[0][0]
     end_ts = segments[-1][1] if len(segments) > 1 else max(
-        map(lambda op: op[f'{operation_type}_end_ts'], operations_per_segment[segments[0]]))
+        map(lambda op: op['ts'] + op['dur'], operations_per_segment[segments[0]]))
 
-    working_times, n_ranks = compute_activity_stats(segments, operations_per_segment, operation_type)
+    working_times, n_ranks = compute_activity_stats(segments, operations_per_segment)
 
     stats = {
         'start_ts': start_ts,
         'end_ts': end_ts,
         'segments_cnt': len(segments),
         'n_ranks_avg': statistics.mean(n_ranks),
-        'duration_avg': (segments[-1][0] - start_ts).total_seconds() / (len(segments) - 1) if len(
-            segments) > 1 else (end_ts - start_ts).total_seconds(),
+        'duration_avg': (segments[-1][0] - start_ts) / (len(segments) - 1) if len(segments) > 1 else end_ts - start_ts,
         'working_time_avg': statistics.mean(working_times),
         'working_time_cv': statistics.stdev(working_times) / statistics.mean(working_times) if len(
             working_times) > 2 else 0,
         'data_operated_avg': statistics.mean(
-            map(lambda op_l: sum(map(lambda op: op['written' if operation_type == 'write' else 'read'], op_l)),
-                operations_per_segment.values())),
+            map(lambda op_l: sum(map(lambda op: op['args']['count'], op_l)), operations_per_segment.values())),
         'metadata_operations_avg': statistics.mean(
-            map(lambda op_l: sum(map(lambda op: 2 * op['opens'], op_l)),
+            map(lambda op_l: sum(map(lambda op: 2 * op['args']['opens'], op_l)),
                 operations_per_segment.values())) + statistics.mean(
-            map(lambda op_l: sum(map(lambda op: op['seeks'], op_l)),
+            map(lambda op_l: sum(map(lambda op: op['args']['seeks'], op_l)),
                 operations_per_segment.values())),
     }
     return stats
 
 
-def compute_activity_stats(segments: list, operations_per_segment: dict, operation_type: str) -> (list, list):
+def compute_activity_stats(segments: list, operations_per_segment: dict) -> (list, list):
     """
     Compute activity stats for a group of segments
     @param segments: list of segments in a group
     @param operations_per_segment: dictionary of operations contained in each segment
-    @param operation_type: type of operation to characterize (read/write)
     @return: list of activity ratio per segment, list of average number of ranks per segment
     """
     working_times = []
@@ -297,21 +104,22 @@ def compute_activity_stats(segments: list, operations_per_segment: dict, operati
         earliest_start = None
         latest_end = None
         for operation in operations_per_segment[segment]:
-            s += operation['read_total_duration' if operation_type == 'read' else 'write_total_duration']
+            # TODO change to real I/O time if possible, instead of full operation duration
+            s += operation['dur']
             if not earliest_start:
-                earliest_start = operation[f'{operation_type}_start_ts']
+                earliest_start = operation['ts']
             else:
-                earliest_start = min(operation[f'{operation_type}_start_ts'], earliest_start)
+                earliest_start = min(operation['ts'], earliest_start)
             if not latest_end:
-                latest_end = operation[f'{operation_type}_end_ts']
+                latest_end = operation['ts'] + operation['dur']
             else:
-                latest_end = max(operation[f'{operation_type}_end_ts'], latest_end)
-        working_times.append((latest_end - earliest_start).total_seconds())
+                latest_end = max(operation['ts'] + operation['dur'], latest_end)
+        working_times.append(latest_end - earliest_start)
         n_ranks.append(s / working_times[-1])
     return working_times, n_ranks
 
 
-def remove_characterized_segments(segments: list, start: datetime, end: datetime) -> list:
+def remove_characterized_segments(segments: list, start: float, end: float) -> list:
     """
     Remove a segment
     @param segments: list of all segments
@@ -322,57 +130,53 @@ def remove_characterized_segments(segments: list, start: datetime, end: datetime
     return list(filter(lambda s: s[0] > end or s[1] < start, segments))
 
 
-def merge_neighbours(operations: list, operation_type: str, total_seconds: int, avg_empty: float) -> None:
+def merge_neighbours(operations: list, total_seconds: int, avg_empty: float) -> None:
     """
     Merge neighboring operations
     @param operations: list of all operations
-    @param operation_type: type of operation to characterize (read/write)
     @param total_seconds: trace's duration in seconds
     @param avg_empty: average duration between two operations
     """
     n_ops = len(operations)
     i = 0
     while i < n_ops - 1:
-        o1_s, o1_e = operations[i][f'{operation_type}_start_ts'], operations[i][f'{operation_type}_end_ts']
-        o2_s, o2_e = operations[i + 1][f'{operation_type}_start_ts'], operations[i + 1][f'{operation_type}_end_ts']
-        d = (o2_s - o1_e).total_seconds()
-        dt = (o2_e - o1_s).total_seconds()
-        if (d < .001 * total_seconds or d < 0.75 * avg_empty or d / dt < .01) and (
-                o2_s - o1_e).total_seconds() < 1.5 * max((
-                                                                 o1_e - o1_s).total_seconds(),
-                                                         (
-                                                                 o2_e - o2_s).total_seconds()):
-            operations[i] = new_operation_from_merge(operations, i, operation_type)
+        o1_s, o1_e = operations[i]['ts'], operations[i]['ts'] + operations[i]['dur']
+        o2_s, o2_e = operations[i + 1]['ts'], operations[i + 1]['ts'] + operations[i + 1]['dur']
+        d = o2_s - o1_e
+        dt = o2_e - o1_s
+        if (d < .001 * total_seconds or d < 0.75 * avg_empty or d / dt < .01) and o2_s - o1_e < 1.5 * max(o1_e - o1_s,
+                                                                                                          o2_e - o2_s):
+            operations[i] = new_operation_from_merge(operations, i)
             operations.pop(i + 1)
             n_ops -= 1
         else:
             i += 1
 
 
-def new_operation_from_merge(operations: list, i: int, operation_type: str) -> dict:
+def new_operation_from_merge(operations: list, i: int) -> dict:
     """
     Merge two operations to create a new one
     @param operations: list of all operations
     @param i: index of the first operation to merge
-    @param operation_type: type of operation to characterize (read/write)
     @return: dictionary representation of the merged operation
     """
-    o1_s, o1_e = operations[i][f'{operation_type}_start_ts'], operations[i][f'{operation_type}_end_ts']
-    o2_s, o2_e = operations[i + 1][f'{operation_type}_start_ts'], operations[i + 1][f'{operation_type}_end_ts']
-    return {
-        'read': operations[i]['read'] + operations[i + 1]['read'] if operation_type == 'read' else None,
-        'read_start_ts': min(o1_s, o2_s) if operation_type == 'read' else None,
-        'read_end_ts': max(o1_e, o2_e) if operation_type == 'read' else None,
-        'written': operations[i]['written'] + operations[i + 1][
-            'written'] if operation_type == 'write' else None,
-        'write_start_ts': min(o1_s, o2_s) if operation_type == 'write' else None,
-        'write_end_ts': max(o1_e, o2_e) if operation_type == 'write' else None,
-        'read_total_duration': operations[i]['read_total_duration'] + operations[i + 1]['read_total_duration'],
-        'write_total_duration': operations[i]['write_total_duration'] + operations[i + 1][
-            'write_total_duration'],
-        'opens': operations[i]['opens'] + operations[i + 1]['opens'],
-        'seeks': operations[i]['seeks'] + operations[i + 1]['seeks']
-    }
+    new_op = copy(operations[i])
+    new_op['dur'] = operations[i + 1]['ts'] + operations[i + 1]['dur'] - new_op['ts']
+    new_op['args']['count'] += operations[i + 1]['args']['count']
+    new_op['args']['speed'] = new_op['args']['count'] / new_op['dur']
+    if new_op['args']['file'] != operations[i + 1]['args']['file']:
+        new_op['args']['file'] = os.path.commonprefix([new_op['args']['file'], operations[i + 1]['args']['file']])
+    if new_op['args']['opens'] is not None and operations[i + 1]['args']['opens'] is not None:
+        new_op['args']['opens'] += operations[i + 1]['args']['opens']
+    else:
+        new_op['args']['opens'] = None
+    if new_op['args']['seeks'] is not None and operations[i + 1]['args']['seeks'] is not None:
+        new_op['args']['seeks'] += operations[i + 1]['args']['seeks']
+    else:
+        new_op['args']['seeks'] = None
+    if new_op['args']['offset'] != operations[i + 1]['args']['offset']:
+        new_op['args']['offset'] = None
+    return new_op
 
 
 def compute_metadata_stats(trace: dict, mount: str, spike_threshold: int) -> dict:
@@ -384,28 +188,21 @@ def compute_metadata_stats(trace: dict, mount: str, spike_threshold: int) -> dic
     @return: dictionary containing metadata statistics
     """
     windows = {}
-    operations = list(filter(lambda x: x['file'].startswith(mount), trace['access']))
+    operations = list(filter(lambda x: x['name'] in ['read', 'write'] and x['args']['opens'] is not None and x['args'][
+        'seeks'] is not None and x['args']['file'].startswith(mount), trace['traceEvents']))
     for operation in operations:
-        if operation['opens'] + operation['seeks'] == 0:
+        if operation['args']['opens'] + operation['args']['seeks'] == 0:
             continue
-        timestamp_start = min(int(operation['write_start_ts'].timestamp() if operation[
-                                                                                 'write_start_ts'] != 0 else datetime.now().timestamp()),
-                              int(operation['read_start_ts'].timestamp()) if operation[
-                                                                                 'read_start_ts'] != 0 else datetime.now().timestamp())
-        timestamp_end = max(int(operation['write_end_ts'].timestamp() if operation[
-                                                                             'write_end_ts'] != 0 else datetime.strptime(
-            '1980', '%Y').timestamp()),
-                            int(operation['read_end_ts'].timestamp()) if operation[
-                                                                             'read_end_ts'] != 0 else datetime.strptime(
-                                '1980', '%Y').timestamp())
+        timestamp_start = operation['ts']
+        timestamp_end = timestamp_start + operation['dur']
         if timestamp_start in windows:
-            windows[timestamp_start] += operation['opens'] + operation['seeks']
+            windows[timestamp_start] += operation['args']['opens'] + operation['args']['seeks']
         else:
-            windows[timestamp_start] = operation['opens'] + operation['seeks']
+            windows[timestamp_start] = operation['args']['opens'] + operation['args']['seeks']
         if timestamp_end in windows:
-            windows[timestamp_end] += operation['opens']
+            windows[timestamp_end] += operation['args']['opens']
         else:
-            windows[timestamp_end] = operation['opens']
+            windows[timestamp_end] = operation['args']['opens']
     if len(windows) == 0:
         return {
             'highest_spike': 0,
@@ -437,111 +234,107 @@ def find_periodic_patterns(trace: dict, operation_type: str, mount: str) -> (lis
     @return: list of dictionaries representing each group of segments
     """
     operations = sorted(list(
-        filter(lambda x: x['written' if operation_type == 'write' else 'read'] != 0 and x['file'].startswith(mount),
-               trace['access'])), key=lambda x: x[f'{operation_type}_start_ts'])
+        filter(lambda x: x['name'] == operation_type and x['args']['file'].startswith(mount),
+               trace['traceEvents'])), key=lambda x: x['ts'])
 
-    total_amount = sum(map(lambda x: x['written' if operation_type == 'write' else 'read'], operations))
-    opens = sum(map(lambda x: x['opens'], operations))
-    seeks = sum(map(lambda x: x['seeks'], operations))
+    for op in operations:
+        op['ts'] *= 1e-6
+        op['dur'] *= 1e-6
 
-    if total_amount < 100e6 and opens <= trace['infos']['nprocs'] and seeks <= trace['infos']['nprocs']:
+    total_amount = sum(map(lambda x: x['args']['count'], operations))
+
+    if total_amount == 0:
         return {}, trace
 
-    empty_count, total_empty_duration = compute_inactivity_stats(operations, operation_type)
+    empty_count, total_empty_duration = compute_inactivity_stats(operations)
 
     if empty_count > 0:
-        merge_neighbours(operations, operation_type,
-                         (trace['infos']['end_ts'] - trace['infos']['start_ts']).total_seconds(),
+        merge_neighbours(operations, trace['metadata']['end_ts'] - trace['metadata']['start_ts'],
                          total_empty_duration / empty_count)
 
-    segments, operations_per_segments = create_segments(operations, operation_type)
+    segments, operations_per_segments = create_segments(operations)
 
     classified_segments = []
     while segments:
-        classified_segments += classify_one_segment_group(segments, operation_type, operations_per_segments)
+        classified_segments += classify_one_segment_group(segments, operations_per_segments)
         operations_per_segments = {key: value for key, value in operations_per_segments.items() if key in segments}
 
     return sorted(classified_segments, key=lambda x: x['start_ts']), trace
 
 
-def compute_inactivity_stats(operations: list, operation_type: str) -> (int, int):
+def compute_inactivity_stats(operations: list) -> (int, int):
     """
     Compute inactivity stats
     @param operations: list of all operations
-    @param operation_type: type of operation to characterize (read/write)
     @return: number of inactive segments, total inactivity duration in seconds
     """
     empty_count = 0
     total_empty_duration = 0
     for i in range(len(operations) - 1):
-        if operations[i + 1][f'{operation_type}_start_ts'] > operations[i][f'{operation_type}_end_ts']:
+        if operations[i + 1]['ts'] > operations[i]['ts'] + operations[i]['dur']:
             empty_count += 1
-            total_empty_duration += (operations[i + 1][f'{operation_type}_start_ts'] - operations[i][
-                f'{operation_type}_end_ts']).total_seconds()
+            total_empty_duration += operations[i + 1]['ts'] - operations[i]['ts'] + operations[i]['dur']
     return empty_count, total_empty_duration
 
 
-def create_segments(operations: list, operation_type: str) -> (list, dict):
+def create_segments(operations: list) -> (list, dict):
     """
     Create segments from the list of operations
     @param operations: list of all operations
-    @param operation_type: type of operation to characterize (read/write)
     @return: list of segments, dictionary of operations contained per segment
     """
     segments = []
     operations_per_segments = {}
     while operations:
-        operations_in_segment, seg_start, latest_end = create_one_segment(operations, operation_type)
+        operations_in_segment, seg_start, latest_end = create_one_segment(operations)
         seg_end = latest_end
         # if last segment and amount close to previous one, expand current segment to match the length of the
         # previous one to potentially include it in periodic segments
         if not operations and segments:
             po_s, po_e = segments[-1]
-            seg_end = seg_start + timedelta(seconds=(po_e - po_s).total_seconds())
+            seg_end = seg_start + po_e - po_s
         segments.append((seg_start, seg_end))
         operations_per_segments[(seg_start, seg_end)] = operations_in_segment
     return segments, operations_per_segments
 
 
-def create_one_segment(operations, operation_type) -> (list, datetime, datetime):
+def create_one_segment(operations) -> (list, float, float):
     """
     Create one segment from the first operation in the list
     @param operations: list of remaining operations to include in segments
-    @param operation_type: type of operation to characterize (read/write)
     @return: list of operations contained in the segment, start and end timestamps of segment
     """
     operations_in_segment = []
     new_op = copy(operations.pop(0))
-    seg_start = new_op[f'{operation_type}_start_ts']
+    seg_start = new_op['ts']
     operations_in_segment.append(new_op)
-    latest_end = new_op[f'{operation_type}_end_ts']
+    latest_end = new_op['ts'] + new_op['dur']
     while operations:
         next_op = operations[0]
         # the next operation is outside of this segment, break
-        if next_op[f'{operation_type}_start_ts'] > latest_end:
-            latest_end = next_op[f'{operation_type}_start_ts']
+        if next_op['ts'] > latest_end:
+            latest_end = next_op['ts']
             break
         # the next operation is contained by this segment (start before end of operations in segment)
         else:
-            latest_end = max(latest_end, next_op[f'{operation_type}_end_ts'])
+            latest_end = max(latest_end, next_op['ts'] + next_op['dur'])
             operations_in_segment.append(next_op)
             operations.pop(0)
     return operations_in_segment, seg_start, latest_end
 
 
-def classify_one_segment_group(segments: list, operation_type: str, operations_per_segments: dict) -> list:
+def classify_one_segment_group(segments: list, operations_per_segments: dict) -> list:
     """
     Clusterize segments, characterize the smallest group, and remove members from remaining segments
     @param segments: list of segments
-    @param operation_type: type of operation to characterize (read/write)
     @param operations_per_segments: dictionary of operations contained per segment
     @return: list of classified segments
     """
     classified_segments = []
-    segment_durations = list(map(lambda s: (s[1] - s[0]).total_seconds(), segments))
+    segment_durations = list(map(lambda s: s[1] - s[0], segments))
     segments_amount = np.array(
-        [sum(map(lambda v: v['written' if operation_type == 'write' else 'read'], value)) for key, value in
-         operations_per_segments.items()], dtype=np.float64)
+        [sum(map(lambda v: v['args']['count'], value)) for key, value in operations_per_segments.items()],
+        dtype=np.float64)
     segment_duration_classes = clusterize(segment_durations, segments_amount)
     least_common_class, _ = Counter(segment_duration_classes).most_common()[-1]
     cleaned_segments, cleaned_labels, cleaned_operations_per_segment = copy(segments), copy(
@@ -550,7 +343,7 @@ def classify_one_segment_group(segments: list, operation_type: str, operations_p
     filtered_operation_per_segment = {key: value for key, value in cleaned_operations_per_segment.items() if
                                       key in segment_group}
     classified_segments.append(
-        segment_characterization(filtered_operation_per_segment, segment_group, operation_type))
+        segment_characterization(filtered_operation_per_segment, segment_group))
     for seg in segment_group:
         if seg not in segments:
             segments = remove_characterized_segments(segments, seg[0], seg[1])

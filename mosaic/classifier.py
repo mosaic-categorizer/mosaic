@@ -1,5 +1,3 @@
-from datetime import timedelta, datetime
-
 import numpy as np
 
 
@@ -83,15 +81,15 @@ def classify_periodicity(patterns: dict, operation_type: str) -> list:
         map(lambda p: p['segments_cnt'], filter(lambda p: p['segments_cnt'] == 1, patterns[operation_type])))
     total_periodic_access_count = sum(
         map(lambda p: p['segments_cnt'], filter(lambda p: p['segments_cnt'] != 1, patterns[operation_type])))
-    if total_periodic_access_count > 3 * single_access_pattern_count:
+    if total_periodic_access_count > 2:
         classes.append(f'{operation_type}_periodic')
 
-        mean_periodic_duration = ((max(
+        mean_periodic_duration = (max(
             map(lambda p: p['end_ts'],
                 filter(lambda p: p['segments_cnt'] != 1, patterns[operation_type]))) - min(
             map(lambda p: p['start_ts'],
                 filter(lambda p: p['segments_cnt'] != 1,
-                       patterns[operation_type])))).total_seconds()) / total_periodic_access_count
+                       patterns[operation_type])))) / total_periodic_access_count
         if mean_periodic_duration <= 30:
             classes.append(f'{operation_type}_periodic_s')
         elif mean_periodic_duration <= 1800:
@@ -141,15 +139,15 @@ def load_operations(patterns: list) -> dict:
     operations = {}
     for pattern in patterns:
         for i in range(pattern['segments_cnt']):
-            start = pattern['start_ts'] + timedelta(seconds=i * pattern['duration_avg'])
-            end = start + timedelta(seconds=pattern['working_time_avg'])
+            start = pattern['start_ts'] + (i * pattern['duration_avg'])
+            end = start + pattern['working_time_avg']
             if (start, end) not in operations:
                 operations[(start, end)] = 0
             operations[(start, end)] += pattern['data_operated_avg']
     return operations
 
 
-def compute_amount_histogram(operations: dict, start: datetime, end: datetime) -> (list, float, float, float, float):
+def compute_amount_histogram(operations: dict, start: float, end: float) -> (list, float, float, float, float):
     """
     Create an histogram of the volume of operations in 3 time chunks
     @param operations: dictionary containing all operations
@@ -158,13 +156,13 @@ def compute_amount_histogram(operations: dict, start: datetime, end: datetime) -
     @return: list of quantity in all chunks, coefficient of variations between all chunks
     """
     amount_histogram = [0, 0, 0]
-    start_end = start + timedelta(seconds=(end - start).total_seconds() / 4)
-    end_start = end - timedelta(seconds=(end - start).total_seconds() / 4)
+    start_end = start + ((end - start) / 4)
+    end_start = end - ((end - start) / 4)
     for (op_start, op_end) in operations:
         amount = operations[(op_start, op_end)]
-        duration = (op_end - op_start).total_seconds()
-        s1_amount = max(0, min(1, (start_end - op_start).total_seconds() / duration)) * amount
-        s3_amount = max(0, min(1, (op_end - end_start).total_seconds() / duration)) * amount
+        duration = op_end - op_start
+        s1_amount = max(0, min(1, (start_end - op_start) / duration)) * amount
+        s3_amount = max(0, min(1, (op_end - end_start) / duration)) * amount
         s2_amount = amount - s1_amount - s3_amount
         amount_histogram[0] += s1_amount
         amount_histogram[1] += s2_amount
@@ -203,11 +201,13 @@ def compute_amount_histogram(operations: dict, start: datetime, end: datetime) -
 def generate_trace_vector(trace_data: dict, merged_operations: dict) -> str:
     vect = ''
     vect += f'{trace_data["infos"]["run_time"]},{trace_data["module"]["read_duration"]},{trace_data["module"]["write_duration"]},{trace_data["module"]["read_process_count"]},{trace_data["module"]["write_process_count"]},{trace_data["module"]["read_operations"]},{trace_data["module"]["write_operations"]},{trace_data["module"]["read_files"]},{trace_data["module"]["written_files"]},{trace_data["module"]["read"]},{trace_data["module"]["written"]}'
-    read_hist = compute_amount_histogram(load_operations(merged_operations['read']), merged_operations['infos']['start_ts'],
-                                         merged_operations['infos']['end_ts'])[0]
+    read_hist = \
+    compute_amount_histogram(load_operations(merged_operations['read']), merged_operations['infos']['start_ts'],
+                             merged_operations['infos']['end_ts'])[0]
     vect += f',{",".join(str(n / max(1, sum(read_hist))) for n in read_hist)}'
-    write_hist = compute_amount_histogram(load_operations(merged_operations['write']), merged_operations['infos']['start_ts'],
-                                          merged_operations['infos']['end_ts'])[0]
+    write_hist = \
+    compute_amount_histogram(load_operations(merged_operations['write']), merged_operations['infos']['start_ts'],
+                             merged_operations['infos']['end_ts'])[0]
     vect += f',{",".join(str(n / max(1, sum(write_hist))) for n in write_hist)}'
     single_read_pattern_count = sum(
         map(lambda p: p['segments_cnt'], filter(lambda p: p['segments_cnt'] == 1, merged_operations['read'])))
