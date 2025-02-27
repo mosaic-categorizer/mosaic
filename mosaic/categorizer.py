@@ -243,28 +243,28 @@ class Categorizer:
             for class_name in classes:
                 if class_name not in class_count_processed:
                     class_count_processed[class_name] = 0
-                    if self.traces_of_hash:
+                    if hasattr(self, 'traces_of_hash'):
                         class_count_all[class_name] = 0
                     traces_of_class[class_name] = []
                 class_count_processed[class_name] += 1
-                if self.traces_of_hash:
+                if hasattr(self, 'traces_of_hash'):
                     class_count_all[class_name] += len(self.traces_of_hash[self.get_exec_hash(trace)])
                 traces_of_class[class_name].append(trace)
 
         classes = list(class_count_processed.keys())
         categorized_traces = len(self.traces_to_process) - n_canceled - failed
-        if self.traces_of_hash:
+        if hasattr(self, 'traces_of_hash'):
             estimated_categorized_all_traces = sum(
                 map(lambda prog: len(self.traces_of_hash[self.get_exec_hash(trace)]), processed_traces))
         for class_ in classes:
             class_count_processed[f'{class_}_distribution'] = round(class_count_processed[class_] / categorized_traces,
                                                                     3)
-            if self.traces_of_hash:
+            if hasattr(self, 'traces_of_hash'):
                 class_count_all[f'{class_}_distribution'] = round(
                     class_count_all[class_] / estimated_categorized_all_traces, 3)
 
         class_count_processed = dict(sorted(class_count_processed.items(), key=lambda x: x[0]))
-        if self.traces_of_hash:
+        if hasattr(self, 'traces_of_hash'):
             class_count_all = dict(sorted(class_count_all.items(), key=lambda x: x[0]))
 
         with open(os.path.join(self.output_directory, 'summary.json'), "w") as file:
@@ -274,12 +274,13 @@ class Categorizer:
                     'processed_traces': len(self.traces_to_process),
                     'canceled_categorizations': n_canceled,
                     'failed_categorizations': failed,
-                    'inferred_executions': estimated_categorized_all_traces
+
                 },
                 'classes_job_processed': class_count_processed
             }
-            if self.traces_of_hash:
+            if hasattr(self, 'traces_of_hash'):
                 summary['classes_estimated_all_jobs'] = class_count_all
+                summary['infos']['inferred_executions'] = estimated_categorized_all_traces
             json.dump(summary, file, indent=4)
         traces_of_class = dict(sorted(traces_of_class.items(), key=lambda x: x[0]))
         all_traces = list(set(sum(traces_of_class.values(), [])))
@@ -288,7 +289,7 @@ class Categorizer:
              for cls, trace_lst in traces_of_class.items()},
             index=all_traces)
         self.generate_heatmaps(class_matrix, traces_of_class, False)
-        if self.traces_of_hash:
+        if hasattr(self, 'traces_of_hash'):
             class_matrix_estimated_all = pd.DataFrame(
                 {cls: [len(self.traces_of_hash[self.get_exec_hash(t)]) if t in trace_lst else 0 for t in all_traces]
                  for cls, trace_lst in traces_of_class.items()},
