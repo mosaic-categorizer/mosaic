@@ -55,7 +55,7 @@ class Categorizer:
                     self.traces_of_hash[h].append(t)
                 with open(os.path.join(trace_directory, 'trace_hashes.json'), 'w') as f:
                     json.dump(self.traces_of_hash, f)
-            self.traces_to_process = list(self.traces_of_hash[hg][0] for hg in self.traces_of_hash)
+            self.traces_to_process = list(random.choice(self.traces_of_hash[hg]) for hg in self.traces_of_hash)
         else:
             self.traces_to_process = copy(self.traces)
 
