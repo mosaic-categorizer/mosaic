@@ -46,6 +46,10 @@ class Categorizer:
                 print(f'Restoring traces hashes from {os.path.join(trace_directory, "trace_hashes.json")}')
                 with open(os.path.join(trace_directory, 'trace_hashes.json')) as f:
                     self.traces_of_hash = json.load(f)
+                if os.path.isfile(os.path.join(output_directory, 'processed_traces.json')):
+                    print(f'Restoring traces to process from {os.path.join(output_directory, "processed_traces.json")}')
+                    with open(os.path.join(output_directory, "processed_traces.json")) as f:
+                        self.traces_to_process = json.load(f)
             else:
                 self.traces_of_hash = {}
                 for t in self.traces:
@@ -55,12 +59,25 @@ class Categorizer:
                     self.traces_of_hash[h].append(t)
                 with open(os.path.join(trace_directory, 'trace_hashes.json'), 'w') as f:
                     json.dump(self.traces_of_hash, f)
-            self.traces_to_process = list(random.choice(self.traces_of_hash[hg]) for hg in self.traces_of_hash)
+            if not self.traces_to_process:
+                self.traces_to_process = list(random.choice(self.traces_of_hash[hg]) for hg in self.traces_of_hash)
+                with open(os.path.join(output_directory, 'processed_traces.json'), 'w') as f:
+                    json.dump(self.traces_to_process, f)
         else:
             self.traces_to_process = copy(self.traces)
 
         print(
             f'Selected {len(self.traces_to_process)} ({"{:.2f}".format(100 * len(self.traces_to_process) / len(self.traces))}%) traces to process')
+
+        old_count = len(self.traces_to_process)
+        existing_results = set()
+        for file in os.listdir(output_directory):
+            if file.endswith('.class.json'):
+                existing_results.add(os.path.join(trace_directory, file.replace('.class.json', '')))
+        self.traces_to_process = [trace for trace in self.traces_to_process if trace not in existing_results]
+
+        if len(self.traces_to_process) != old_count:
+            print(f'{old_count - len(self.traces_to_process)} traces were already processed, continuing with {len(self.traces_to_process)} traces')
 
         Path(output_directory).mkdir(parents=True, exist_ok=True)
         if generate_graphs:
@@ -446,8 +463,8 @@ def categorize_dispy(trace: str, output_directory: str, output_graphs: bool, mou
     except Exception as e:
         return f'failed (setup): {e}', []
     try:
-        if os.path.isfile(os.path.join(output_directory, trace.split('/')[-1] + '.json')):
-            with open(os.path.join(output_directory, trace.split('/')[-1] + '.json'), "r") as file:
+        if os.path.isfile(os.path.join(output_directory, trace.split('/')[-1] + '.class.json')):
+            with open(os.path.join(output_directory, trace.split('/')[-1] + '.class.json'), "r") as file:
                 classes = json.load(file)['classes']
             return trace, [class_list for category in classes.values() for class_list in category]
         if trace.endswith('.json'):
@@ -468,7 +485,7 @@ def categorize_dispy(trace: str, output_directory: str, output_graphs: bool, mou
         if output_graphs and (len(write_segments) > 0 or len(read_segments) > 0):
             visualize(write_job, write_segments, classes['write_classes'], read_job, read_segments,
                       classes['read_classes'], os.path.join(output_directory, 'graphs'), mount)
-        with open(os.path.join(output_directory, trace.split('/')[-1] + '.json'), "w") as file:
+        with open(os.path.join(output_directory, trace.split('/')[-1] + '.class.json'), "w") as file:
             json.dump(result, file, indent=4)
     except Exception as e:
         print(' Error extracting patterns of trace', trace, e, file=sys.stderr)
