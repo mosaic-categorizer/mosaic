@@ -29,6 +29,7 @@ def classify_accesses(operations: dict, operation_type: str) -> list:
     classes = []
     classes += classify_access_temporality(operations, operation_type)
     classes += classify_periodicity(operations, operation_type)
+    classes += [classify_amounts(operations[operation_type], operation_type)]
     return classes
 
 
@@ -66,6 +67,26 @@ def classify_access_temporality(patterns: dict, operation_type: str) -> list:
         classes.append(f'{operation_type}_unclear_pattern')
 
     return classes
+
+
+def classify_amounts(patterns: dict, operation_type: str) -> str:
+    total_amount = 0
+    for pattern in patterns:
+        total_amount += pattern['segments_cnt'] * pattern['data_operated_avg']
+    total_amount /= 8
+    if total_amount < .5 * 1e6:
+        return f'{operation_type}_KiB'
+    if total_amount < .5 * 1e9:
+        return f'{operation_type}_MiB'
+    if total_amount < .5 * 1e10:
+        return f'{operation_type}_1_GiB'
+    if total_amount < .5 * 1e11:
+        return f'{operation_type}_10_GiB'
+    if total_amount < .5 * 1e12:
+        return f'{operation_type}_100_GiB'
+    if total_amount < .5 * 1e13:
+        return f'{operation_type}_1_TiB'
+    return f'{operation_type}_10_TiB_or_more'
 
 
 def classify_periodicity(patterns: dict, operation_type: str) -> list:
