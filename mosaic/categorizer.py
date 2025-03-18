@@ -1,16 +1,23 @@
+import contextlib
 import gzip
 import json
 import os
 import random
 import signal
+import sys
 import time
 from copy import copy
 from pathlib import Path
 
-import dispy
 import matplotlib.pyplot as plt
 import pandas as pd
 import seaborn as sns
+from tqdm import tqdm
+
+from mosaic.classifier import classify_trace
+from mosaic.periodicity_finder import compute_metadata_stats, find_periodic_patterns
+from mosaic.process_pool import ProcessPool
+from mosaic.visualizer import visualize
 
 kill_switch, save_switch = False, False
 
@@ -18,26 +25,29 @@ kill_switch, save_switch = False, False
 class Categorizer:
 
     def __init__(self, trace_directory: str = 'none', output_directory: str = './out', generate_graphs: bool = True,
-                 mount: str = '/', prune_executions: bool = True, dispy_nodes: str = 'localhost'):
+                 mount: str = '/', prune_executions: bool = True):
         """
         @param trace_directory: directory where .darshan or .darshan.pkl.bz2 files are located (default: 'none')
         @param output_directory: directory where .json result files will be saved (default: ./out)
         @param generate_graphs: generate html graphs to show activity (default: True)
         @param mount: mounting point of PFS in darshan traces (default: /)
         @param prune_executions: only keep one execution for each application (default: True)
-        @param dispy_nodes: address of dispy nodes (default: 'localhost'); can be an array of str
         """
         self.traces: list = []
         self.traces_to_process: list = []
         self.trace_hash_cache = {}
+        self.trace_directory = trace_directory
         self.output_directory = output_directory
         self.generate_graphs = generate_graphs
         self.mount = mount
-        self.dispy_nodes = dispy_nodes.replace(' ', '').split(',')
+
+        Path(output_directory).mkdir(parents=True, exist_ok=True)
+        if generate_graphs:
+            Path(os.path.join(output_directory, 'graphs')).mkdir(parents=True, exist_ok=True)
 
         for file in os.listdir(trace_directory):
             if file.endswith('.json') or file.endswith('.json.gz'):
-                self.traces.append(os.path.join(trace_directory, file))
+                self.traces.append(file)
 
         print(f'Found {len(self.traces)} traces in {trace_directory}')
 
@@ -46,13 +56,17 @@ class Categorizer:
                 print(f'Restoring traces hashes from {os.path.join(trace_directory, "trace_hashes.json")}')
                 with open(os.path.join(trace_directory, 'trace_hashes.json')) as f:
                     self.traces_of_hash = json.load(f)
+                    for h in self.traces_of_hash:
+                        for t in self.traces_of_hash[h]:
+                            self.trace_hash_cache[t] = h
                 if os.path.isfile(os.path.join(output_directory, 'processed_traces.json')):
                     print(f'Restoring traces to process from {os.path.join(output_directory, "processed_traces.json")}')
                     with open(os.path.join(output_directory, "processed_traces.json")) as f:
                         self.traces_to_process = json.load(f)
             else:
                 self.traces_of_hash = {}
-                for t in self.traces:
+                print('Generating hashes from traces')
+                for t in tqdm(self.traces, file=sys.stdout, unit='traces'):
                     h = self.get_exec_hash(t)
                     if not h in self.traces_of_hash:
                         self.traces_of_hash[h] = []
@@ -77,11 +91,8 @@ class Categorizer:
         self.traces_to_process = [trace for trace in self.traces_to_process if trace not in existing_results]
 
         if len(self.traces_to_process) != old_count:
-            print(f'{old_count - len(self.traces_to_process)} traces were already processed, continuing with {len(self.traces_to_process)} traces')
-
-        Path(output_directory).mkdir(parents=True, exist_ok=True)
-        if generate_graphs:
-            Path(os.path.join(output_directory, 'graphs')).mkdir(parents=True, exist_ok=True)
+            print(
+                f'{old_count - len(self.traces_to_process)} traces were already processed, continuing with {len(self.traces_to_process)} traces')
 
     def categorize_trace(self, trace: str) -> None:
         """
@@ -89,7 +100,7 @@ class Categorizer:
         @param trace: path of trace to categorize
         """
         start = time.time()
-        categorize_dispy(trace, os.path.abspath(self.output_directory), self.generate_graphs, self.mount, os.getcwd())
+        categorize_trace(trace, os.path.abspath(self.output_directory), self.generate_graphs, self.mount, os.getcwd())
         print(f'\nDone. Total time: {time.time() - start}')
 
     def categorize_all_traces(self, timeout: int = -1, sort_strategy: str = 'random', update_rate: int = 1) -> None:
@@ -102,109 +113,36 @@ class Categorizer:
         global kill_switch, save_switch
         start = time.time()
         print(f'Categorizing {len(self.traces_to_process)} traces:')
-        jobs = []
 
         self.sort_traces(sort_strategy)
 
-        cluster = dispy.JobCluster(categorize_dispy,
-                                   nodes=self.dispy_nodes,
-                                   reentrant=True,
-                                   ping_interval=1)
+        process_pool = ProcessPool(os.cpu_count() - 1)
         for trace in self.traces_to_process:
-            trace = cluster.submit(trace, os.path.abspath(self.output_directory), self.generate_graphs, self.mount,
-                                   os.getcwd())
-            trace.id = trace
-            jobs.append(trace)
-        n_jobs = len(jobs)
+            process_pool.submit(categorize_trace, os.path.join(self.trace_directory, trace), os.path.abspath(self.output_directory), self.generate_graphs, self.mount, os.getcwd())
         kill_switch, save_switch = False, False
         signal.signal(signal.SIGINT, stop_signal_handler)
         signal.signal(signal.SIGTSTP, save_signal_handler)
-        last_processed_count = -1
-        while True:
-            pending_jobs = sum(j.status < 8 for j in jobs)
-            status = []
-            for i in range(5, 12):
-                status.append(f'({sum(j.status == i for j in jobs)})')
-            print(
-                f"\rCompleted {n_jobs - pending_jobs} out of {n_jobs} ({format_duration(time.time() - start)}) {' '.join(status)}",
-                end='', flush=True)
-            if save_switch:
-                save_switch = False
-                last_processed_count = self.generate_report_with_est(jobs, last_processed_count)
-            if 0 < timeout < time.time() - start or not pending_jobs or kill_switch:
-                break
-            time.sleep(update_rate)
+        last_count = 0
+        last_export_count = 0
+        start_time = time.time()
+        with tqdm(total=len(self.traces_to_process), file=sys.stdout, unit='traces') as pbar:
+            while process_pool.is_running():
+                time.sleep(update_rate)
+                count = process_pool.get_n_done()
+                if count > last_count:
+                    pbar.update(count - last_count)
+                    last_count = count
+                else:
+                    pbar.refresh()
+                if save_switch:
+                    last_export_count = self.generate_report_with_est_from_dispy(process_pool.get_result(), last_export_count)
+                    save_switch = False
+                if 0 < timeout < (time.time() - start_time) or kill_switch:
+                    process_pool.kill()
+                    kill_switch = False
         signal.signal(signal.SIGINT, signal.SIG_DFL)
-        if 0 < timeout < time.time() - start or kill_switch:
-            print('\nTimeout exceeded, cancelling the remaining jobs')
-            last_processed_count = self.generate_report_with_est(jobs, last_processed_count)
-            print('Result exported')
-            jobs_to_cancel = [job for job in jobs if job.status != dispy.DispyJob.Finished]
-            for trace in jobs_to_cancel:
-                if trace.status != dispy.DispyJob.Finished:
-                    cluster.cancel(trace)
-        else:
-            print('\nAll jobs completed within the timeout')
-        cluster.close()
-        self.generate_report_with_est(jobs, last_processed_count)
-        print(f'\nDone. Total time: {time.time() - start}')
-
-    def convert_darshan_to_tef(self, trace: str) -> None:
-        """
-        Turns a trace into a .darshan.pkl.bz2 file
-        @param trace: path of trace to simplify
-        """
-        start = time.time()
-        export_tef_traces(trace, os.path.abspath(self.output_directory), self.mount, os.getcwd())
-        print(f'\nDone. Total time: {time.time() - start}')
-
-    def convert_all_darshan_to_tef(self, timeout: int = -1, sort_strategy: str = 'random',
-                                   update_rate: int = 1) -> None:
-        """
-        Simplify all selected traces
-        @param timeout: maximum processing time in seconds; -1 if unlimited
-        @param sort_strategy: ordering strategy to process traces
-        @param update_rate: progress update rate in seconds
-        """
-        global kill_switch
-        start = time.time()
-        print(f'Categorizing {len(self.traces)} traces:')
-        jobs = []
-
-        self.sort_traces(sort_strategy)
-
-        cluster = dispy.JobCluster(export_tef_traces,
-                                   nodes=self.dispy_nodes,
-                                   reentrant=True,
-                                   ping_interval=1)
-        for job in self.traces_to_process:
-            job = cluster.submit(job, os.path.abspath(self.output_directory), self.mount, os.getcwd())
-            job.id = job
-            jobs.append(job)
-        n_jobs = len(jobs)
-        kill_switch = False
-        signal.signal(signal.SIGINT, stop_signal_handler)
-        while True:
-            pending_jobs = sum(j.status < 8 for j in jobs)
-            status = []
-            for i in range(5, 12):
-                status.append(f'({sum(j.status == i for j in jobs)})')
-            print(
-                f'\rCompleted {n_jobs - pending_jobs} out of {n_jobs} ({format_duration(time.time() - start)}) {" ".join(status)}',
-                end='', flush=True)
-            if 0 < timeout < time.time() - start or not pending_jobs or kill_switch:
-                break
-            time.sleep(update_rate)
-        signal.signal(signal.SIGINT, signal.SIG_DFL)
-        if 0 < timeout < time.time() - start or kill_switch:
-            print('\nTimeout exceeded, cancelling the remaining jobs')
-            jobs_to_cancel = [job for job in jobs if job.status != dispy.DispyJob.Finished]
-            for job in jobs_to_cancel:
-                if job.status != dispy.DispyJob.Finished:
-                    cluster.cancel(job)
-        else:
-            print('\nAll jobs completed within the timeout')
-        cluster.close()
+        signal.signal(signal.SIGTSTP, signal.SIG_DFL)
+        self.generate_report_with_est_from_dispy(process_pool.get_result(), last_export_count)
         print(f'\nDone. Total time: {time.time() - start}')
 
     def sort_traces(self, strategy: str) -> None:
@@ -222,7 +160,7 @@ class Categorizer:
             return
         trace_sizes = {}
         for trace in self.traces_to_process:
-            trace_sizes[trace] = os.stat(trace).st_size
+            trace_sizes[trace] = os.stat(os.path.join(self.trace_directory, trace)).st_size
         if strategy == 'heaviest':
             self.traces_to_process = sorted(self.traces_to_process, key=trace_sizes.get, reverse=True)
             return
@@ -231,30 +169,52 @@ class Categorizer:
             return
         raise NotImplementedError(f'{strategy} sort strategy not implemented')
 
-    def generate_report_with_est(self, jobs: list, last_processed_count: int = -1) -> int:
+    def generate_report_with_est_from_files(self) -> None:
+        results = []
+        for p_trace in self.traces_to_process:
+            if os.path.isfile(os.path.join(self.output_directory, p_trace + '.class.json')):
+                with open(os.path.join(self.output_directory, p_trace + '.class.json')) as f:
+                    j = json.load(f)
+                    results.append((p_trace,
+                                    [class_list for category in j['classes'].values() for class_list in category]))
+        self.generate_report_with_est(results, len(self.traces_to_process), len(results))
+
+    def generate_report_with_est_from_dispy(self, jobs: list, last_processed_count: int = -1) -> int:
         """
         Generate .json report file when categorization is from .darshan files and produce global estimations
         @param jobs: Dispy jobs
         @param last_processed_count: number of processed traces from the previous report
         @return: number of processed traces in the newly generated report
         """
-        done_jobs = [job() for job in jobs if job.status == dispy.DispyJob.Finished]
-        n_job = len(jobs)
-        n_done = len(done_jobs)
-        n_canceled = n_job - n_done
-        print(f'Processed successfully {n_done} traces over {n_job}')
-        results = [(job[0], job[1]) for job in done_jobs if job[1]]
+        results = [(job[0], job[1]) for job in jobs]
+        print(f'Got results for {len(results)} traces. Exporting figures')
         if len(results) == last_processed_count:
             print('Results were already exported')
             return last_processed_count
-        print('Exporting results')
+        self.generate_report_with_est(results, len(self.traces_to_process), len(results))
+        print('Export done')
+        return len(results)
+
+    def generate_report_with_est(self, results: list, n_selected: int, n_found: int) -> None:
+        """
+        Generate .json report file when categorization is from .darshan files and produce global estimations
+        @param results: results from processed traces
+        @param n_selected: number of selected traces to be processed
+        @param n_found: number of found traces
+        @return: number of processed traces in the newly generated report
+        """
+        n_canceled = n_selected - n_found
         class_count_processed, class_count_all, traces_of_class = {}, {}, {}
         processed_traces = set()
         failed = 0
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(self.output_directory + '/error.txt')
         for res in results:
             trace, classes = res
-            if trace == 'failed':
+            if trace.startswith('failed'):
                 failed += 1
+                with open(self.output_directory + '/error.txt', 'a') as file:
+                    file.write(trace + '\n')
                 continue
             processed_traces.add(trace)
             for class_name in classes:
@@ -314,7 +274,6 @@ class Categorizer:
             self.generate_heatmaps(class_matrix_estimated_all, traces_of_class, True, '_estimated_all')
         with open(os.path.join(self.output_directory, 'traces_of_class.json'), "w") as file:
             json.dump(traces_of_class, file, indent=4)
-        return n_done
 
     def generate_heatmaps(self, class_matrix: pd.DataFrame, traces_of_class: dict, estimate_all_traces: bool,
                           suffix: str = '') -> None:
@@ -378,7 +337,7 @@ class Categorizer:
                 with open(trace, 'r') as f:
                     job = json.load(f)
             elif trace.endswith('.json.gz'):
-                with gzip.open(trace, 'r') as f:
+                with gzip.open(os.path.join(self.trace_directory, trace), 'r') as f:
                     job = json.load(f)
             self.trace_hash_cache[trace] = f'{job["metadata"]["uid"]}{job["metadata"]["exe"]}{len(job["traceEvents"])}'
         return self.trace_hash_cache[trace]
@@ -439,7 +398,7 @@ def save_signal_handler(_signum, _frame):
     save_switch = True
 
 
-def categorize_dispy(trace: str, output_directory: str, output_graphs: bool, mount: str, path: str,
+def categorize_trace(trace: str, output_directory: str, output_graphs: bool, mount: str, path: str,
                      metadata_spike_threshold: int = 10) -> (str, list):
     """
     Processing function when categorizing traces with Dispy jobs
@@ -452,17 +411,6 @@ def categorize_dispy(trace: str, output_directory: str, output_graphs: bool, mou
     @return: trace name, list of assigned classes
     """
     try:
-        os.environ['OPENBLAS_NUM_THREADS'] = '1'
-        import sys
-        sys.path.append(path)
-        import json
-        import gzip
-        from mosaic.classifier import classify_trace, generate_trace_vector
-        from mosaic.periodicity_finder import compute_metadata_stats, find_periodic_patterns
-        from mosaic.visualizer import visualize
-    except Exception as e:
-        return f'failed (setup): {e}', []
-    try:
         if os.path.isfile(os.path.join(output_directory, trace.split('/')[-1] + '.class.json')):
             with open(os.path.join(output_directory, trace.split('/')[-1] + '.class.json'), "r") as file:
                 classes = json.load(file)['classes']
@@ -474,7 +422,7 @@ def categorize_dispy(trace: str, output_directory: str, output_graphs: bool, mou
             with gzip.open(trace, 'r') as f:
                 job = json.load(f)
         else:
-            raise NotImplementedError(f'Unsupported trace format: {trace.split("/")[-1]}')
+            raise NotImplementedError(f'Unsupported trace format: {trace}')
         metadata = compute_metadata_stats(job, mount, metadata_spike_threshold)
         write_segments, write_job = find_periodic_patterns(job, 'write', mount)
         read_segments, read_job = find_periodic_patterns(job, 'read', mount)
@@ -488,31 +436,6 @@ def categorize_dispy(trace: str, output_directory: str, output_graphs: bool, mou
         with open(os.path.join(output_directory, trace.split('/')[-1] + '.class.json'), "w") as file:
             json.dump(result, file, indent=4)
     except Exception as e:
-        print(' Error extracting patterns of trace', trace, e, file=sys.stderr)
-        return f'failed: {e}', []
+        print(' Error extracting patterns of trace ', trace, ' ', e, file=sys.stderr)
+        return f'failed to process {trace}: {e}', []
     return trace, [class_list for category in classes.values() for class_list in category]
-
-
-def export_tef_traces(trace: str, output_directory: str, mount: str, path: str) -> (
-        str, list):
-    """
-    Processing function when simplifying traces with Dispy jobs
-    @param trace: trace to process
-    @param output_directory: directory to save output .darshan.pkl.bz2 files
-    @param mount: mounting point of PFS in darshan trace
-    @param path: working path of Mosaic
-    @return: trace name
-    """
-    try:
-        os.environ['OPENBLAS_NUM_THREADS'] = '1'
-        import sys
-        sys.path.append(path)
-        from mosaic.tef_generators.darshan_to_tef import generate_trace_event_json
-    except Exception as e:
-        return f'failed (setup): {e}', []
-    try:
-        generate_trace_event_json(trace, os.path.join(output_directory, trace + '.json.gz'), mount)
-    except Exception as e:
-        print(' Error extracting patterns of trace', trace, e)
-        return f'failed: {e}', []
-    return trace

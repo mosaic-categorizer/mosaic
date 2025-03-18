@@ -1,9 +1,12 @@
 import gzip
 import json
+import os
 from datetime import datetime, timedelta
 
 import pandas as pd
 from darshan.report import DarshanReport
+
+from mosaic.process_pool import ProcessPool
 
 
 def export_metadata(report: DarshanReport, name: str) -> dict:
@@ -130,8 +133,11 @@ def generate_op_metadata(pid: int, node_count: int) -> list:
     return res
 
 
-def generate_trace_event_json(trace: str, output_filename: str, mount: str = '/'):
-    report = DarshanReport(trace, read_all=True)
+def generate_trace_event_json(trace: str, output_directory: str, mount: str = '/'):
+    try:
+        report = DarshanReport(trace, read_all=True)
+    except Exception as e:
+        return f'error {trace}: {e}'
     trace_name = trace.split('/')[-1]
     metadata = export_metadata(report, trace_name)
     pid = metadata['job_id']
@@ -145,5 +151,21 @@ def generate_trace_event_json(trace: str, output_filename: str, mount: str = '/'
         "traceEvents": operations,
         "metadata": metadata,
     }
-    with gzip.open(output_filename, 'wt') as f:
+    with gzip.open(os.path.join(output_directory, trace.split('/')[-1] + '.json.gz'), 'wt') as f:
         json.dump(perfetto_trace, f, indent=2)
+    return ''
+
+
+def generate_traces_from_directory(darshan_directory: str, output_directory: str, mount: str = '/'):
+    traces_to_convert = []
+    for file in os.listdir(darshan_directory):
+        if file.endswith('.darshan'):
+            traces_to_convert.append(file)
+    process_pool = ProcessPool(os.cpu_count() - 1)
+    for trace in traces_to_convert:
+        process_pool.submit(generate_trace_event_json, os.path.join(darshan_directory, trace), output_directory, mount)
+    process_pool.wait_completion()
+    for result in process_pool.get_result():
+        if result.startswith('error'):
+            with open(os.path.join(output_directory, 'errors.txt'), 'a') as f:
+                f.write(result + '\n')
