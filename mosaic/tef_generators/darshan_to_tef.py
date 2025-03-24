@@ -2,6 +2,7 @@ import gzip
 import json
 import os
 from datetime import datetime, timedelta
+from pathlib import Path
 
 import pandas as pd
 from darshan.report import DarshanReport
@@ -161,6 +162,7 @@ def generate_traces_from_directory(darshan_directory: str, output_directory: str
     for file in os.listdir(darshan_directory):
         if file.endswith('.darshan'):
             traces_to_convert.append(file)
+    Path(output_directory).mkdir(parents=True, exist_ok=True)
     process_pool = ProcessPool(os.cpu_count() - 1)
     for trace in traces_to_convert:
         process_pool.submit(generate_trace_event_json, os.path.join(darshan_directory, trace), output_directory, mount)
