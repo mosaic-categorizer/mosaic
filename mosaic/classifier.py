@@ -10,8 +10,8 @@ def classify_trace(trace_operations: dict, significant_read: bool, significant_w
     @return: dictionary containing classes assigned
     """
     metadata_classes = classify_metadata(trace_operations['metadata'])
-    read_classes = classify_accesses(trace_operations, 'read') if significant_read else ['read_insignificant']
-    write_classes = classify_accesses(trace_operations, 'write') if significant_write else ['write_insignificant']
+    read_classes = classify_accesses(trace_operations, 'read') if significant_read else ['read_nothing']
+    write_classes = classify_accesses(trace_operations, 'write') if significant_write else ['write_nothing']
     return {
         'metadata_classes': metadata_classes,
         'read_classes': read_classes,

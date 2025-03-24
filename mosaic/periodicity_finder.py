@@ -244,7 +244,7 @@ def find_periodic_patterns(trace: dict, operation_type: str, mount: str) -> (lis
     total_amount = sum(map(lambda x: x['args']['count'], operations))
 
     if total_amount == 0:
-        return {}, trace
+        return [], trace
 
     empty_count, total_empty_duration = compute_inactivity_stats(operations)
 

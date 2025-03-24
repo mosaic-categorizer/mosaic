@@ -1,8 +1,11 @@
+import csv
 import os
 from datetime import datetime
 
+import matplotlib.pyplot as plt
 import plotly.graph_objs as go
 from plotly.offline import plot
+import seaborn as sns
 
 
 def visualize(trace_write: dict, pattern_write: list, write_classes: list, trace_read: dict, pattern_read: list,
@@ -168,3 +171,33 @@ def create_metadata_trace(trace: dict, operation_type: str, mount: str) -> go.Sc
 
     return go.Scatter(x=x_ts, y=y_amount, mode='lines', name='Metadata Operations',
                       line=dict(color='green', width=3))
+
+
+def generate_class_repartition_wrt_io(sizes_per_class: dict, output_directory: str) -> None:
+    for class_ in sizes_per_class:
+        p = sns.displot(sizes_per_class[class_], bins=100, kde=True, log_scale=True)
+        p.savefig(os.path.join(output_directory, f'kde_{class_}.svg'))
+        plt.close(p.figure)
+
+
+def generate_box_plots(sizes_per_class: dict, output_directory: str) -> None:
+    plots_fields = []
+    if os.path.exists('box_plots.conf.csv'):
+        with open('box_plots.conf.csv', 'r') as csv_file:
+            reader = csv.reader(csv_file)
+            for row in reader:
+                plots_fields.append(row)
+        if set(sizes_per_class.keys()) - set([x for xs in plots_fields for x in xs]):
+            print(f'Box plots generation - warning: classes {set(sizes_per_class.keys()) - set([x for xs in plots_fields for x in xs])} are not set to be exported in box plots in box_plots.conf.csv')
+    else:
+        plots_fields = [sorted(sizes_per_class.keys())]
+    for i in range(len(plots_fields)):
+        fields = plots_fields[i]
+        fig = go.Figure()
+        for f in fields:
+            if f not in sizes_per_class:
+                continue
+            fig.add_trace(go.Box(y=sizes_per_class[f], boxpoints=False, name=f))
+        with open(os.path.join(output_directory, f'class_distribution_io_size_plot_{i + 1}.html'), 'w') as f:
+            fig.update_yaxes(type='log')
+            f.write(plot(fig, output_type='div'))
