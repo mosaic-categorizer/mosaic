@@ -1,4 +1,4 @@
-darshan~=3.4.4.0
+darshan~=3.4.6.0
 kaleido~=0.2.1
 matplotlib~=3.9.0rc2
 numpy~=1.26.4
