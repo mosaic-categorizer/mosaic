@@ -1,11 +1,13 @@
 import gzip
 import json
 import os
+import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
 from darshan.report import DarshanReport
+from tqdm import tqdm
 
 from mosaic.process_pool import ProcessPool
 
@@ -135,6 +137,8 @@ def generate_op_metadata(pid: int, node_count: int) -> list:
 
 
 def generate_trace_event_json(trace: str, output_directory: str, mount: str = '/'):
+    if os.path.isfile(os.path.join(output_directory, trace.split('/')[-1] + 'tef.json.gz')):
+        return ''
     try:
         report = DarshanReport(trace, read_all=True)
     except Exception as e:
@@ -152,7 +156,7 @@ def generate_trace_event_json(trace: str, output_directory: str, mount: str = '/
         "traceEvents": operations,
         "metadata": metadata,
     }
-    with gzip.open(os.path.join(output_directory, trace.split('/')[-1] + '.json.gz'), 'wt') as f:
+    with gzip.open(os.path.join(output_directory, trace.split('/')[-1] + 'tef.json.gz'), 'wt') as f:
         json.dump(perfetto_trace, f, indent=2)
     return ''
 
@@ -161,11 +165,10 @@ def generate_traces_from_directory(darshan_directory: str, output_directory: str
     traces_to_convert = []
     for file in os.listdir(darshan_directory):
         if file.endswith('.darshan'):
-            traces_to_convert.append(file)
+            traces_to_convert.append(os.path.join(darshan_directory, file))
     Path(output_directory).mkdir(parents=True, exist_ok=True)
     process_pool = ProcessPool(os.cpu_count() - 1)
-    for trace in traces_to_convert:
-        process_pool.submit(generate_trace_event_json, os.path.join(darshan_directory, trace), output_directory, mount)
+    process_pool.batch_submit(traces_to_convert, generate_trace_event_json, output_directory, mount)
     process_pool.wait_completion()
     for result in process_pool.get_result():
         if result.startswith('error'):

@@ -46,10 +46,13 @@ class Categorizer:
             Path(os.path.join(output_directory, 'graphs')).mkdir(parents=True, exist_ok=True)
 
         for file in os.listdir(trace_directory):
-            if file.endswith('.json') or file.endswith('.json.gz'):
+            if file.endswith('.tef.json') or file.endswith('.tef.json.gz'):
                 self.traces.append(file)
 
         print(f'Found {len(self.traces)} traces in {trace_directory}')
+
+        if len(self.traces) == 0:
+            return
 
         if prune_executions:
             if os.path.isfile(os.path.join(trace_directory, 'trace_hashes.json')):
@@ -67,8 +70,7 @@ class Categorizer:
                 self.traces_of_hash = {}
                 print('Generating hashes from traces')
                 process_pool = ProcessPool(os.cpu_count() - 1)
-                for trace in self.traces:
-                    process_pool.submit(compute_trace_hash, trace, self.trace_directory)
+                process_pool.batch_submit(self.traces, compute_trace_hash, self.trace_directory)
                 process_pool.wait_completion()
                 for res in process_pool.get_result():
                     trace, h = res
@@ -78,6 +80,7 @@ class Categorizer:
                 with open(os.path.join(trace_directory, 'trace_hashes.json'), 'w') as f:
                     json.dump(self.traces_of_hash, f)
             if not self.traces_to_process:
+                print('Select traces to process')
                 self.traces_to_process = list(random.choice(self.traces_of_hash[hg]) for hg in self.traces_of_hash)
                 with open(os.path.join(output_directory, 'processed_traces.json'), 'w') as f:
                     json.dump(self.traces_to_process, f)
@@ -104,7 +107,7 @@ class Categorizer:
         @param trace: path of trace to categorize
         """
         start = time.time()
-        categorize_trace(trace, os.path.abspath(self.output_directory), self.generate_graphs, self.mount, os.getcwd())
+        categorize_trace(trace, os.path.abspath(self.output_directory), self.generate_graphs, self.mount)
         print(f'\nDone. Total time: {time.time() - start}')
 
     def categorize_all_traces(self, timeout: int = -1, sort_strategy: str = 'random', update_rate: int = 1) -> None:
@@ -121,9 +124,9 @@ class Categorizer:
         self.sort_traces(sort_strategy)
 
         process_pool = ProcessPool(os.cpu_count() - 1)
-        for trace in self.traces_to_process:
-            process_pool.submit(categorize_trace, os.path.join(self.trace_directory, trace),
-                                os.path.abspath(self.output_directory), self.generate_graphs, self.mount, os.getcwd())
+        process_pool.batch_submit([os.path.join(self.trace_directory, trace) for trace in self.traces_to_process],
+                                  categorize_trace, os.path.abspath(self.output_directory), self.generate_graphs,
+                                  self.mount)
         kill_switch, save_switch = False, False
         signal.signal(signal.SIGINT, stop_signal_handler)
         signal.signal(signal.SIGTSTP, save_signal_handler)
@@ -134,6 +137,7 @@ class Categorizer:
             while process_pool.is_running():
                 time.sleep(update_rate)
                 count = process_pool.get_n_done()
+                process_pool.submit_more_tasks(count)
                 if count > last_count:
                     pbar.update(count - last_count)
                     last_count = count
