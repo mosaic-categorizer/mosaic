@@ -5,6 +5,7 @@ import time
 from concurrent.futures import ProcessPoolExecutor, CancelledError
 from concurrent.futures.process import BrokenProcessPool
 from copy import copy
+from time import sleep
 
 from tqdm import tqdm
 
@@ -13,6 +14,7 @@ class ProcessPool:
 
     def __init__(self, size: int):
         self._executor = ProcessPoolExecutor(max_workers=size)
+        self._size = size
         self._futures = []
         self._to_process = []
         self._fn = None
@@ -21,6 +23,8 @@ class ProcessPool:
 
     def submit(self, fn, *args) -> None:
         self._futures.append(self._executor.submit(fn, *args))
+        if len(self._futures) <= self._size and len(self._to_process) % 5 == 0:
+            sleep(10)
 
     def batch_submit(self, tasks: list, fn, *args, queue_size: int = 1024) -> None:
         self._to_process = copy(tasks)

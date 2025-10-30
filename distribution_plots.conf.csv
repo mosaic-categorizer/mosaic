@@ -1,0 +1,12 @@
+Read Temporality,read_0000,read_0001,read_0010,read_0011,read_0100,read_0101,read_0110,read_0111,read_1000,read_1001,read_1010,read_1011,read_1100,read_1101,read_1110,read_1111
+Write Temporality,write_0000,write_0001,write_0010,write_0011,write_0100,write_0101,write_0110,write_0111,write_1000,write_1001,write_1011,write_1100,write_1101,write_1110,write_1111
+
+Read Periodicity,read_periodic,read_aperiodic
+Write Periodicity,write_periodic,write_aperiodic
+
+Read Volume,read_KB,read_MB,read_1_GB,read_10_GB,read_100_GB,read_1_TB,read_10_TB_or_more
+Write Volume,write_KB,write_MB,write_1_GB,write_10_GB,write_100_GB,write_1_TB,write_10_TB_or_more
+
+Temp 60s,temp_60s_boiling,temp_60s_cold,temp_60s_frozen,temp_60s_hot,temp_60s_warm
+Temp 1800s,temp_1800s_boiling,temp_1800s_cold,temp_1800s_frozen,temp_1800s_hot,temp_1800s_warm
+Temp 3600s,temp_3600s_boiling,temp_3600s_cold,temp_3600s_frozen,temp_3600s_hot,temp_3600s_warm

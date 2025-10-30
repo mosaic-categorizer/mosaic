@@ -1,7 +1,7 @@
 import os
 import statistics
 from collections import Counter
-from copy import copy
+from copy import copy, deepcopy
 
 import numpy as np
 from sklearn.cluster import MeanShift, estimate_bandwidth
@@ -46,6 +46,8 @@ def get_segments_of_label(labels: list, segments: list, target_label: int) -> li
     @param target_label: label to select
     @return: segments with target label
     """
+    labels = copy(labels)
+    segments = copy(segments)
     if len(labels) == 0:
         return []
     res = []
@@ -104,8 +106,7 @@ def compute_activity_stats(segments: list, operations_per_segment: dict) -> (lis
         earliest_start = None
         latest_end = None
         for operation in operations_per_segment[segment]:
-            # TODO change to real I/O time if possible, instead of full operation duration
-            s += operation['dur']
+            s += operation['dur'] * operation['args']['ranks']
             if not earliest_start:
                 earliest_start = operation['ts']
             else:
@@ -144,16 +145,15 @@ def merge_neighbours(operations: list, total_seconds: int, avg_empty: float) -> 
         o2_s, o2_e = operations[i + 1]['ts'], operations[i + 1]['ts'] + operations[i + 1]['dur']
         d = o2_s - o1_e
         dt = o2_e - o1_s
-        if (d < .001 * total_seconds or d < 0.75 * avg_empty or d / dt < .01) and o2_s - o1_e < 1.5 * max(o1_e - o1_s,
-                                                                                                          o2_e - o2_s):
-            operations[i] = new_operation_from_merge(operations, i)
+        if d < .001 * total_seconds or d < 0.5 * avg_empty or d / dt < .01:
+            operations[i] = new_operation_from_merge(operations, i, min(o1_s, o2_s), max(o1_e, o2_e))
             operations.pop(i + 1)
             n_ops -= 1
         else:
             i += 1
 
 
-def new_operation_from_merge(operations: list, i: int) -> dict:
+def new_operation_from_merge(operations: list, i: int, start_ts, end_ts) -> dict:
     """
     Merge two operations to create a new one
     @param operations: list of all operations
@@ -161,9 +161,12 @@ def new_operation_from_merge(operations: list, i: int) -> dict:
     @return: dictionary representation of the merged operation
     """
     new_op = copy(operations[i])
-    new_op['dur'] = operations[i + 1]['ts'] + operations[i + 1]['dur'] - new_op['ts']
+    new_op['ts'] = start_ts
+    new_op['dur'] = end_ts - start_ts
     new_op['args']['count'] += operations[i + 1]['args']['count']
     new_op['args']['speed'] = new_op['args']['count'] / new_op['dur']
+    new_op['args']['ranks'] = (operations[i]['dur'] * operations[i]['args']['ranks'] + operations[i + 1]['dur'] *
+                               operations[i + 1]['args']['ranks']) / new_op['dur']
     if new_op['args']['file'] != operations[i + 1]['args']['file']:
         new_op['args']['file'] = os.path.commonprefix([new_op['args']['file'], operations[i + 1]['args']['file']])
     if new_op['args']['opens'] is not None and operations[i + 1]['args']['opens'] is not None:
@@ -193,8 +196,8 @@ def compute_metadata_stats(trace: dict, mount: str, spike_threshold: int) -> dic
     for operation in operations:
         if operation['args']['opens'] + operation['args']['seeks'] == 0:
             continue
-        timestamp_start = operation['ts']
-        timestamp_end = timestamp_start + operation['dur']
+        timestamp_start = operation['ts'] * 1e-6
+        timestamp_end = timestamp_start + (operation['dur'] * 1e-6)
         if timestamp_start in windows:
             windows[timestamp_start] += operation['args']['opens'] + operation['args']['seeks']
         else:
@@ -208,24 +211,21 @@ def compute_metadata_stats(trace: dict, mount: str, spike_threshold: int) -> dic
             'highest_spike': 0,
             'spike_count': 0,
             'average_per_spike': 0,
-            'operations_per_second': 0,
-            'operations_duration': 0
+            'operations_per_second': 0
         }
     metadata_highest_spike = max(windows.values())
     metadata_spike_count = sum(val >= spike_threshold for val in windows.values())
     metadata_average = statistics.mean(windows.values())
     metadata_op_ps = (sum(windows.values()) / (max(windows.keys()) - min(windows.keys()))) if len(windows) > 1 else 0
-    metadata_ops_duration = max(windows.keys()) - min(windows.keys())
     return {
         'highest_spike': metadata_highest_spike,
         'spike_count': metadata_spike_count,
         'average_per_spike': metadata_average,
-        'operations_per_second': metadata_op_ps,
-        'operations_duration': metadata_ops_duration
+        'operations_per_second': metadata_op_ps
     }
 
 
-def find_periodic_patterns(trace: dict, operation_type: str, mount: str) -> (list, dict):
+def find_periodic_patterns(trace: dict, operation_type: str, mount: str) -> list:
     """
     Create and group segments
     @param trace: dictionary representation of the trace
@@ -233,18 +233,19 @@ def find_periodic_patterns(trace: dict, operation_type: str, mount: str) -> (lis
     @param mount: PFS mounting point
     @return: list of dictionaries representing each group of segments
     """
-    operations = sorted(list(
+    operations = deepcopy(sorted(list(
         filter(lambda x: x['name'] == operation_type and x['args']['file'].startswith(mount),
-               trace['traceEvents'])), key=lambda x: x['ts'])
+               trace['traceEvents'])), key=lambda x: x['ts']))
 
     for op in operations:
         op['ts'] *= 1e-6
         op['dur'] *= 1e-6
+        op['args']['ranks'] = 1
 
     total_amount = sum(map(lambda x: x['args']['count'], operations))
 
     if total_amount == 0:
-        return [], trace
+        return []
 
     empty_count, total_empty_duration = compute_inactivity_stats(operations)
 
@@ -259,7 +260,7 @@ def find_periodic_patterns(trace: dict, operation_type: str, mount: str) -> (lis
         classified_segments += classify_one_segment_group(segments, operations_per_segments)
         operations_per_segments = {key: value for key, value in operations_per_segments.items() if key in segments}
 
-    return sorted(classified_segments, key=lambda x: x['start_ts']), trace
+    return sorted(classified_segments, key=lambda x: x['start_ts'])
 
 
 def compute_inactivity_stats(operations: list) -> (int, int):
@@ -336,14 +337,18 @@ def classify_one_segment_group(segments: list, operations_per_segments: dict) ->
         [sum(map(lambda v: v['args']['count'], value)) for key, value in operations_per_segments.items()],
         dtype=np.float64)
     segment_duration_classes = clusterize(segment_durations, segments_amount)
-    least_common_class, _ = Counter(segment_duration_classes).most_common()[-1]
+    class_counter = Counter(segment_duration_classes).most_common()
+    _, smallest_groups = class_counter[-1]
+    least_common_classes = [c for (c, n) in class_counter if n == smallest_groups]
+    segment_group = []
     cleaned_segments, cleaned_labels, cleaned_operations_per_segment = copy(segments), copy(
         segment_duration_classes), copy(operations_per_segments)
-    segment_group = get_segments_of_label(cleaned_labels, cleaned_segments, least_common_class)
-    filtered_operation_per_segment = {key: value for key, value in cleaned_operations_per_segment.items() if
-                                      key in segment_group}
-    classified_segments.append(
-        segment_characterization(filtered_operation_per_segment, segment_group))
+    for least_common_class in least_common_classes:
+        segments_of_class = get_segments_of_label(cleaned_labels, cleaned_segments, least_common_class)
+        segment_group += segments_of_class
+        filtered_operation_per_segment = {key: value for key, value in cleaned_operations_per_segment.items() if
+                                          key in segments_of_class}
+        classified_segments.append(segment_characterization(filtered_operation_per_segment, segments_of_class))
     for seg in segment_group:
         if seg not in segments:
             segments = remove_characterized_segments(segments, seg[0], seg[1])

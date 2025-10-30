@@ -1,92 +1,94 @@
-import numpy as np
+import math
 
 
-def classify_trace(trace_operations: dict, significant_read: bool, significant_write: bool) -> dict:
+def classify_trace(job: dict, trace_operations: dict) -> dict:
     """
     Classify one trace
-    @param trace_operations: dictionary containing all operations with periodicity
-    @param significant_read: true if read operations are significant, false otherwise
-    @param significant_write: true if write operations are significant, false otherwise
+    @param job: dictionary of the content of the trace
+    @param trace_operations: dictionary containing all operations from the periodicity detection
     @return: dictionary containing classes assigned
     """
-    metadata_classes = classify_metadata(trace_operations['metadata'])
-    read_classes = classify_accesses(trace_operations, 'read') if significant_read else ['read_nothing']
-    write_classes = classify_accesses(trace_operations, 'write') if significant_write else ['write_nothing']
-    return {
-        'metadata_classes': metadata_classes,
-        'read_classes': read_classes,
-        'write_classes': write_classes,
+    classes = {
+        'metadata_classes': classify_metadata(trace_operations['metadata']),
+        'read_classes': classify_accesses(job, trace_operations, 'read'),
+        'write_classes': classify_accesses(job, trace_operations, 'write')
     }
+    return classes
 
 
-def classify_accesses(operations: dict, operation_type: str) -> list:
+def classify_accesses(job: dict, operations: dict, operation_type: str) -> list:
     """
     Classify operations of a given type (read/write)
-    @param operations: dictionary containing all operations with periodicity
+    @param job: dictionary of the content of the trace
+    @param operations: dictionary containing all operations from the periodicity detection
     @param operation_type: type of operation to classify
     @return: list of classes assigned
     """
-    classes = []
-    classes += classify_access_temporality(operations, operation_type)
+    classes = [classify_access_duration(job, operation_type), classify_amounts(job, operation_type),
+               classify_access_temporality(job, operation_type)]
     classes += classify_periodicity(operations, operation_type)
-    classes += [classify_amounts(operations[operation_type], operation_type)]
     return classes
 
 
-def classify_access_temporality(patterns: dict, operation_type: str) -> list:
+def classify_ftio(ftio_res: dict, operation_type: str) -> list:
+    classes = []
+    if operation_type in ftio_res.keys():
+        classes.append(operation_type + get_periodicity_magnitude(ftio_res[operation_type]))
+    return classes
+
+
+def classify_access_duration(job: dict, operation_type: str) -> str:
+    """
+    Classify access duration of operations of given type (read/write)
+    @param job: dictionary of the trace
+    @param operation_type: type of operation to classify
+    @return: duration class assigned
+    """
+    operations = [op for op in job['traceEvents'] if op['name'] == operation_type]
+    total_io = sum(op['dur'] * 1e-6 for op in operations)
+    if total_io == 0:
+        return f'{operation_type}_duration_0'
+    if total_io < 60:
+        return f'{operation_type}_duration_less_1m'
+    elif total_io < 300:
+        return f'{operation_type}_duration_1m_to_5m'
+    elif total_io < 1800:
+        return f'{operation_type}_duration_5m_to_30m'
+    elif total_io < 3600:
+        return f'{operation_type}_duration_30m_to_1h'
+    else:
+        return f'{operation_type}_duration_1h_or_more'
+
+
+def classify_access_temporality(job: dict, operation_type: str) -> str:
     """
     Classify access temporality of operations of given type (read/write)
-    @param patterns: dictionary containing all operations with periodicity
+    @param job: dictionary of the trace
     @param operation_type: type of operation to classify
     @return: list of temporality classes assigned
     """
-    classes = []
-
-    histogram, hist_cv, hist_cv_before_end, hist_cv_after_start, hist_cv_start_end = compute_amount_histogram(
-        load_operations(patterns[operation_type]),
-        patterns['infos'][
-            'start_ts'],
-        patterns['infos']['end_ts'])
-
-    if histogram[0] > 2 * (histogram[1] + histogram[2]):
-        classes.append(f'{operation_type}_on_start')
-    elif histogram[0] < (histogram[1] + histogram[2]) / 5 and hist_cv_after_start < .25:
-        classes.append(f'{operation_type}_after_start')
-    if histogram[2] > 2 * (histogram[0] + histogram[1]):
-        classes.append(f'{operation_type}_on_end')
-    elif histogram[2] < (histogram[0] + histogram[1]) / 5 and hist_cv_before_end < .25:
-        classes.append(f'{operation_type}_before_end')
-    if histogram[0] + histogram[2] > 4 * histogram[1] and hist_cv_start_end < .25:
-        classes.append(f'{operation_type}_on_start_and_on_end')
-    if histogram[1] > 4 * (histogram[0] + histogram[2]):
-        classes.append(f'{operation_type}_after_start_before_end')
-    if hist_cv < .25:
-        classes.append(f'{operation_type}_steady')
-
-    if not classes:
-        classes.append(f'{operation_type}_unclear_pattern')
-
-    return classes
+    operations = [op for op in job['traceEvents'] if op['name'] == operation_type]
+    active_chunks = find_active_chunks(operations, job['metadata']['start_ts'], job['metadata']['run_time'])
+    return f'{operation_type}_{"".join(["1" if active else "0" for active in active_chunks])}'
 
 
-def classify_amounts(patterns: dict, operation_type: str) -> str:
-    total_amount = 0
-    for pattern in patterns:
-        total_amount += pattern['segments_cnt'] * pattern['data_operated_avg']
-    total_amount /= 8
+def classify_amounts(job: dict, operation_type: str) -> str:
+    total_amount = sum([op['args']['count'] for op in job['traceEvents'] if op['name'] == operation_type])
+    if total_amount == 0:
+        return f'{operation_type}_0'
     if total_amount < .5 * 1e6:
-        return f'{operation_type}_KiB'
+        return f'{operation_type}_KB'
     if total_amount < .5 * 1e9:
-        return f'{operation_type}_MiB'
+        return f'{operation_type}_MB'
     if total_amount < .5 * 1e10:
-        return f'{operation_type}_1_GiB'
+        return f'{operation_type}_1_GB'
     if total_amount < .5 * 1e11:
-        return f'{operation_type}_10_GiB'
+        return f'{operation_type}_10_GB'
     if total_amount < .5 * 1e12:
-        return f'{operation_type}_100_GiB'
+        return f'{operation_type}_100_GB'
     if total_amount < .5 * 1e13:
-        return f'{operation_type}_1_TiB'
-    return f'{operation_type}_10_TiB_or_more'
+        return f'{operation_type}_1_TB'
+    return f'{operation_type}_10_TB_or_more'
 
 
 def classify_periodicity(patterns: dict, operation_type: str) -> list:
@@ -98,38 +100,37 @@ def classify_periodicity(patterns: dict, operation_type: str) -> list:
     """
     classes = []
 
-    single_access_pattern_count = sum(
-        map(lambda p: p['segments_cnt'], filter(lambda p: p['segments_cnt'] == 1, patterns[operation_type])))
-    total_periodic_access_count = sum(
-        map(lambda p: p['segments_cnt'], filter(lambda p: p['segments_cnt'] != 1, patterns[operation_type])))
-    if total_periodic_access_count > 2:
+    ftio_res = patterns['ftio']
+    classes += classify_ftio(ftio_res, operation_type)
+
+    if patterns[operation_type]:
+        total_periodic_access_count = sum(
+            map(lambda p: p['segments_cnt'], filter(lambda p: p['segments_cnt'] != 1, patterns[operation_type])))
+        if total_periodic_access_count > 2:
+            mean_periodic_duration = (max(
+                map(lambda p: p['end_ts'],
+                    filter(lambda p: p['segments_cnt'] != 1, patterns[operation_type]))) - min(
+                map(lambda p: p['start_ts'],
+                    filter(lambda p: p['segments_cnt'] != 1,
+                           patterns[operation_type])))) / total_periodic_access_count
+            classes.append(operation_type + get_periodicity_magnitude(mean_periodic_duration))
+    if len(classes) > 0:
         classes.append(f'{operation_type}_periodic')
-
-        mean_periodic_duration = (max(
-            map(lambda p: p['end_ts'],
-                filter(lambda p: p['segments_cnt'] != 1, patterns[operation_type]))) - min(
-            map(lambda p: p['start_ts'],
-                filter(lambda p: p['segments_cnt'] != 1,
-                       patterns[operation_type])))) / total_periodic_access_count
-        if mean_periodic_duration <= 30:
-            classes.append(f'{operation_type}_periodic_s')
-        elif mean_periodic_duration <= 1800:
-            classes.append(f'{operation_type}_periodic_min')
-        elif mean_periodic_duration <= 43200:
-            classes.append(f'{operation_type}_periodic_h')
-        else:
-            classes.append(f'{operation_type}_periodic_day_or_more')
-
-        mean_periodic_activity = sum(map(lambda p: p['segments_cnt'] * p['working_time_avg'] / p['duration_avg'],
-                                         filter(lambda p: p['segments_cnt'] != 1,
-                                                patterns[operation_type]))) / total_periodic_access_count
-
-        if mean_periodic_activity <= .25:
-            classes.append(f'{operation_type}_periodic_low_busy_time')
-        elif mean_periodic_activity >= .75:
-            classes.append(f'{operation_type}_periodic_high_busy_time')
+    else:
+        classes.append(f'{operation_type}_aperiodic')
 
     return classes
+
+
+def get_periodicity_magnitude(mean_period) -> str:
+    if mean_period <= 30:
+        return '_periodic_s'
+    elif mean_period <= 1800:
+        return '_periodic_min'
+    elif mean_period <= 43200:
+        return '_periodic_h'
+    else:
+        return '_periodic_day_or_more'
 
 
 def classify_metadata(stats: dict) -> list:
@@ -139,7 +140,7 @@ def classify_metadata(stats: dict) -> list:
     @return: list of metadata classes assigned
     """
     classes = []
-    if stats['highest_spike'] > 250:
+    if stats['highest_spike'] > 1000:
         classes.append('metadata_high_spike')
     if stats['operations_per_second'] > 50 and stats['spike_count'] > 5:
         classes.append('metadata_high_density')
@@ -168,67 +169,40 @@ def load_operations(patterns: list) -> dict:
     return operations
 
 
-def compute_amount_histogram(operations: dict, start: float, end: float) -> (list, float, float, float, float):
+def find_active_chunks(events: list, start: float, duration: float, n_chunks: int = 4) -> list:
     """
     Create an histogram of the volume of operations in 3 time chunks
-    @param operations: dictionary containing all operations
+    @param events: list containing the operations from which the temporality is computed
     @param start: start timestamp
-    @param end: end timestamp
-    @return: list of quantity in all chunks, coefficient of variations between all chunks
+    @param duration: duration of the trace
+    @param n_chunks: number of chunks to create, default is 4
+    @return: list of booleans, True if activity in the chunk, False otherwise
     """
-    amount_histogram = [0, 0, 0]
-    start_end = start + ((end - start) / 4)
-    end_start = end - ((end - start) / 4)
-    for (op_start, op_end) in operations:
-        amount = operations[(op_start, op_end)]
-        duration = op_end - op_start
-        s1_amount = max(0, min(1, (start_end - op_start) / duration)) * amount
-        s3_amount = max(0, min(1, (op_end - end_start) / duration)) * amount
-        s2_amount = amount - s1_amount - s3_amount
-        amount_histogram[0] += s1_amount
-        amount_histogram[1] += s2_amount
-        amount_histogram[2] += s3_amount
-    cv_total = (np.std(
-        np.array(
-            [amount_histogram[0], amount_histogram[1] / 2, amount_histogram[1] / 2, amount_histogram[2]]),
-        dtype=np.float64) / np.mean(
-        np.array(
-            [amount_histogram[0], amount_histogram[1] / 2, amount_histogram[1] / 2, amount_histogram[2]]),
-        dtype=np.float64)) if sum(amount_histogram) > 0 else 0
-    cv_before_end = (np.std(
-        np.array(
-            [amount_histogram[0], amount_histogram[1] / 2, amount_histogram[1] / 2]),
-        dtype=np.float64) / np.mean(
-        np.array(
-            [amount_histogram[0], amount_histogram[1] / 2, amount_histogram[1] / 2]),
-        dtype=np.float64)) if sum(amount_histogram[:-1]) > 0 else 0
-    cv_after_start = (np.std(
-        np.array(
-            [amount_histogram[1] / 2, amount_histogram[1] / 2, amount_histogram[2]]),
-        dtype=np.float64) / np.mean(
-        np.array(
-            [amount_histogram[1] / 2, amount_histogram[1] / 2, amount_histogram[2]]),
-        dtype=np.float64)) if sum(amount_histogram[1:]) > 0 else 0
-    cv_start_and_end = (np.std(
-        np.array(
-            [amount_histogram[0], amount_histogram[2]]),
-        dtype=np.float64) / np.mean(
-        np.array(
-            [amount_histogram[0], amount_histogram[2]]),
-        dtype=np.float64)) if amount_histogram[0] + amount_histogram[2] > 0 else 0
-    return amount_histogram, cv_total, cv_before_end, cv_after_start, cv_start_and_end
+    active_chunks = [False for _ in range(n_chunks)]
+    chunk_duration = duration / n_chunks
+    for event in events:
+        ts = event['ts'] * 1e-6
+        dur = event['dur'] * 1e-6
+        first_chunk = min(math.floor((ts - start) / chunk_duration), n_chunks - 1)
+        last_chunk = min(math.ceil((ts + dur - start) / chunk_duration) - 1, n_chunks - 1)
+        for i in range(first_chunk, last_chunk + 1):
+            try:
+                active_chunks[i] = True
+            except IndexError:
+                raise RuntimeError('Chunk index out of range when computing temporality, incoherent trace')
+    return active_chunks
 
 
 def generate_trace_vector(trace_data: dict, merged_operations: dict) -> str:
     vect = ''
     vect += f'{trace_data["infos"]["run_time"]},{trace_data["module"]["read_duration"]},{trace_data["module"]["write_duration"]},{trace_data["module"]["read_process_count"]},{trace_data["module"]["write_process_count"]},{trace_data["module"]["read_operations"]},{trace_data["module"]["write_operations"]},{trace_data["module"]["read_files"]},{trace_data["module"]["written_files"]},{trace_data["module"]["read"]},{trace_data["module"]["written"]}'
     read_hist = \
-    compute_amount_histogram(load_operations(merged_operations['read']), merged_operations['infos']['start_ts'],
-                             merged_operations['infos']['end_ts'])[0]
+        find_active_chunks(load_operations(merged_operations['read']), merged_operations['infos']['start_ts'],
+                           merged_operations['infos']['end_ts'])[0]
     vect += f',{",".join(str(n / max(1, sum(read_hist))) for n in read_hist)}'
     write_hist = \
-    compute_amount_histogram(load_operations(merged_operations['write']), merged_operations['infos']['start_ts'],
-                             merged_operations['infos']['end_ts'])[0]
+        find_active_chunks(load_operations(merged_operations['write']), merged_operations['infos']['start_ts'],
+                           merged_operations['infos']['end_ts'])[0]
     vect += f',{",".join(str(n / max(1, sum(write_hist))) for n in write_hist)}'
     single_read_pattern_count = sum(
         map(lambda p: p['segments_cnt'], filter(lambda p: p['segments_cnt'] == 1, merged_operations['read'])))
@@ -244,3 +218,58 @@ def generate_trace_vector(trace_data: dict, merged_operations: dict) -> str:
     vect += f',{single_write_pattern_count},{periodic_write_access_count},{distinct_periodic_write_access_count}'
     vect += f',{merged_operations["metadata"]["highest_spike"]},{merged_operations["metadata"]["spike_count"]},{merged_operations["metadata"]["operations_per_second"]}'
     return vect
+
+
+def classify_file_temperatures(temps: dict, half_life: int = 60) -> str:
+    total_temperature = 0
+    for (_, temp) in temps.items():
+        total_temperature += temp
+    if total_temperature == 0:
+        return f'temp_{half_life}s_frozen'
+    if total_temperature < 10:
+        return f'temp_{half_life}s_cold'
+    if total_temperature < 100:
+        return f'temp_{half_life}s_warm'
+    if total_temperature < 500:
+        return f'temp_{half_life}s_hot'
+    return f'temp_{half_life}s_boiling'
+
+
+def classify_multiple_temperatures(temps_mult_hf: dict) -> list:
+    classes = []
+    for half_life in temps_mult_hf.keys():
+        classes.append(classify_file_temperatures(temps_mult_hf[half_life], half_life))
+    return classes
+
+
+def compute_file_temperatures(operations: dict, half_life: int = 60) -> dict:
+    files = {}
+    result = {}
+    coeff = math.log(0.5) / half_life
+    for operation in operations:
+        if operation['name'] not in ['read', 'write']:
+            continue
+        file = operation['args']['file']
+        if not file in files:
+            files[file] = []
+        files[file].append((operation['ts'] * 1e-6, operation['dur'] * 1e-6))
+    for file in files:
+        sorted_files = sorted(files[file], key=lambda x: x[0])
+        score = 0
+        latest_considered_op = 0
+        for i in range(1, len(sorted_files)):
+            if sorted_files[latest_considered_op][0] + sorted_files[latest_considered_op][1] > sorted_files[i][0]:
+                continue
+            relative_ts = sorted_files[i][0] - sorted_files[latest_considered_op][0] - \
+                          sorted_files[latest_considered_op][1]
+            score += math.exp(coeff * relative_ts)
+            latest_considered_op = i
+        result[file] = score
+    return result
+
+
+def compute_file_temperatures_multiple(operations: dict, half_lives: list) -> dict:
+    temperatures = {}
+    for half_life in half_lives:
+        temperatures[half_life] = compute_file_temperatures(operations, half_life)
+    return temperatures

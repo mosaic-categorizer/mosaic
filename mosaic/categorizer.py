@@ -2,6 +2,7 @@ import contextlib
 import gzip
 import json
 import os
+import pathlib
 import random
 import signal
 import sys
@@ -14,18 +15,20 @@ import pandas as pd
 import seaborn as sns
 from tqdm import tqdm
 
-from mosaic.classifier import classify_trace
+from mosaic.classifier import classify_trace, compute_file_temperatures_multiple, classify_multiple_temperatures
+from mosaic.convert_tef_to_ftio import convert_to_ftio, get_main_frequencies
 from mosaic.periodicity_finder import compute_metadata_stats, find_periodic_patterns
 from mosaic.process_pool import ProcessPool
-from mosaic.visualizer import visualize, generate_box_plots, generate_class_repartition_wrt_io
+from mosaic.visualizer import visualize, generate_box_plots, generate_class_repartition_wrt_io, \
+    generate_all_distribution_plots, generate_all_occurrences_plots
 
-kill_switch, save_switch = False, False
+kill_switch = False
 
 
 class Categorizer:
 
     def __init__(self, trace_directory: str = 'none', output_directory: str = './out', generate_graphs: bool = True,
-                 mount: str = '/', prune_executions: bool = True):
+                 mount: str = '/', prune_executions: bool = True, duration_threshold: int = -1, rank: int = -1, n_ranks: int = -1):
         """
         @param trace_directory: directory where .darshan or .darshan.pkl.bz2 files are located (default: 'none')
         @param output_directory: directory where .json result files will be saved (default: ./out)
@@ -33,7 +36,6 @@ class Categorizer:
         @param mount: mounting point of PFS in darshan traces (default: /)
         @param prune_executions: only keep one execution for each application (default: True)
         """
-        self.traces: list = []
         self.traces_to_process: list = []
         self.trace_hash_cache = {}
         self.trace_directory = trace_directory
@@ -45,14 +47,36 @@ class Categorizer:
         if generate_graphs:
             Path(os.path.join(output_directory, 'graphs')).mkdir(parents=True, exist_ok=True)
 
+        traces = []
         for file in os.listdir(trace_directory):
-            if file.endswith('.tef.json') or file.endswith('.tef.json.gz'):
-                self.traces.append(file)
+            if file.endswith('.tef.json') or file.endswith('.json.gz'):
+                traces.append(file)
 
-        print(f'Found {len(self.traces)} traces in {trace_directory}')
+        print(f'Found {len(traces)} traces in {trace_directory}')
+        self.n_traces_in_dir = len(traces)
 
-        if len(self.traces) == 0:
-            return
+        compute_ban_traces_todo = duration_threshold > 0
+        if os.path.isfile(os.path.join(trace_directory, 'banned_traces.json')):
+            with open(os.path.join(trace_directory, 'banned_traces.json')) as f:
+                banned_traces = json.load(f)
+            if banned_traces['threshold'] == duration_threshold:
+                compute_ban_traces_todo = False
+                traces = list(set(traces) - set(banned_traces['banned']))
+            else:
+                pathlib.Path(os.path.join(trace_directory, 'banned_traces.json')).unlink(missing_ok=True)
+                pathlib.Path(os.path.join(trace_directory, 'trace_hashes.json')).unlink(missing_ok=True)
+                pathlib.Path(os.path.join(output_directory, 'processed_traces.json')).unlink(missing_ok=True)
+
+        if compute_ban_traces_todo:
+            pathlib.Path(os.path.join(trace_directory, 'trace_hashes.json')).unlink(missing_ok=True)
+            pathlib.Path(os.path.join(output_directory, 'processed_traces.json')).unlink(missing_ok=True)
+            banned_traces = self.ban_executions_too_short(traces, duration_threshold)
+            traces = list(set(traces) - set(banned_traces))
+
+        self.n_traces_considered = len(traces)
+        if duration_threshold > 0:
+            print(
+                f'{self.n_traces_in_dir - self.n_traces_considered} traces are discarded because under {duration_threshold} seconds')
 
         if prune_executions:
             if os.path.isfile(os.path.join(trace_directory, 'trace_hashes.json')):
@@ -70,7 +94,7 @@ class Categorizer:
                 self.traces_of_hash = {}
                 print('Generating hashes from traces')
                 process_pool = ProcessPool(os.cpu_count() - 1)
-                process_pool.batch_submit(self.traces, compute_trace_hash, self.trace_directory)
+                process_pool.batch_submit(traces, compute_trace_hash, self.trace_directory)
                 process_pool.wait_completion()
                 for res in process_pool.get_result():
                     trace, h = res
@@ -85,10 +109,13 @@ class Categorizer:
                 with open(os.path.join(output_directory, 'processed_traces.json'), 'w') as f:
                     json.dump(self.traces_to_process, f)
         else:
-            self.traces_to_process = copy(self.traces)
+            self.traces_to_process = copy(traces)
+            with open(os.path.join(output_directory, 'processed_traces.json'), 'w') as f:
+                json.dump(self.traces_to_process, f)
 
-        print(
-            f'Selected {len(self.traces_to_process)} ({"{:.2f}".format(100 * len(self.traces_to_process) / len(self.traces))}%) traces to process')
+        if len(traces):
+            print(
+                f'Selected {len(self.traces_to_process)} ({"{:.2f}".format(100 * len(self.traces_to_process) / len(traces))}%) traces to process')
 
         old_count = len(self.traces_to_process)
         existing_results = set()
@@ -101,6 +128,67 @@ class Categorizer:
             print(
                 f'{old_count - len(self.traces_to_process)} traces were already processed, continuing with {len(self.traces_to_process)} traces')
 
+        if rank != -1 and n_ranks != -1:
+            self.traces_to_process = sorted(self.traces_to_process)[rank::n_ranks]
+            print(f'Processing {len(self.traces_to_process)} traces on rank {rank} out of {n_ranks}')
+
+    def ban_executions_too_short(self, traces: list, threshold: int) -> list:
+        print(f'Banning executions under {threshold} seconds')
+        process_pool = ProcessPool(os.cpu_count() - 1)
+        process_pool.batch_submit(traces, exec_is_too_short, self.trace_directory, threshold)
+        process_pool.wait_completion()
+        traces_too_short = []
+        for res in process_pool.get_result():
+            trace, too_short = res
+            if too_short:
+                traces_too_short.append(trace)
+        with open(os.path.join(self.trace_directory, 'banned_traces.json'), 'w') as f:
+            json.dump({'threshold': threshold, 'banned': traces_too_short}, f)
+        return traces_too_short
+
+    def clean_traces(self) -> None:
+        if not os.path.isfile(os.path.join(self.output_directory, 'processed_traces.json')):
+            raise Exception('No traces to process')
+        with open(os.path.join(self.output_directory, "processed_traces.json")) as f:
+            traces_to_process = json.load(f)
+        print(f'{len(traces_to_process)} traces to process')
+        existing_results = set()
+        for file in os.listdir(self.output_directory):
+            if file.endswith('.class.json'):
+                existing_results.add(file.replace('.class.json', ''))
+        print(f'Found {len(existing_results)} existing results')
+        to_delete = set()
+        for result in existing_results:
+            if result not in traces_to_process:
+                to_delete.add(result)
+        print(f'Deleting {len(to_delete)} results not in the list of traces to process')
+
+    def generate_mongodb_export(self):
+        if not os.path.isfile(os.path.join(self.output_directory, 'processed_traces.json')):
+            raise Exception('No traces to process')
+        with open(os.path.join(self.output_directory, "processed_traces.json")) as f:
+            traces_to_process = json.load(f)
+        exported = []
+        error, not_found = 0, 0
+        estimate = hasattr(self, 'traces_of_hash')
+        for trace in traces_to_process:
+            if not os.path.isfile(os.path.join(self.output_directory, f'{trace}.class.json')):
+                not_found += 1
+                continue
+            with open(os.path.join(self.output_directory, f'{trace}.class.json')) as f:
+                j = json.load(f)
+            if j['status'] == 'error':
+                error += 1
+                continue
+            del j['file_temperatures']
+            j['_id'] = self.get_exec_hash(trace)
+            if estimate:
+                j['representation_count'] = len(self.traces_of_hash[self.get_exec_hash(trace)])
+            exported.append(j)
+        with open(os.path.join(self.output_directory, 'mongo_export.json'), 'w') as f:
+            json.dump(exported, f)
+        print(f'Exported {len(exported)} results to mongo_export.json ({error} errors, {not_found} not found)')
+
     def categorize_trace(self, trace: str) -> None:
         """
         Categorize a trace
@@ -110,28 +198,27 @@ class Categorizer:
         categorize_trace(trace, os.path.abspath(self.output_directory), self.generate_graphs, self.mount)
         print(f'\nDone. Total time: {time.time() - start}')
 
-    def categorize_all_traces(self, timeout: int = -1, sort_strategy: str = 'random', update_rate: int = 1) -> None:
+    def categorize_all_traces(self, timeout: int = -1, sort_strategy: str = 'random', update_rate: int = 1,
+                              n_proc=-1) -> None:
         """
         Categorize all selected traces
         @param timeout: maximum processing time in seconds; -1 if unlimited
         @param sort_strategy: ordering strategy to process traces
         @param update_rate: progress update rate in seconds
         """
-        global kill_switch, save_switch
+        global kill_switch
         start = time.time()
         print(f'Categorizing {len(self.traces_to_process)} traces:')
 
         self.sort_traces(sort_strategy)
 
-        process_pool = ProcessPool(os.cpu_count() - 1)
+        process_pool = ProcessPool(os.cpu_count() - 1) if n_proc == -1 else ProcessPool(n_proc)
         process_pool.batch_submit([os.path.join(self.trace_directory, trace) for trace in self.traces_to_process],
                                   categorize_trace, os.path.abspath(self.output_directory), self.generate_graphs,
                                   self.mount)
-        kill_switch, save_switch = False, False
+        kill_switch = False
         signal.signal(signal.SIGINT, stop_signal_handler)
-        signal.signal(signal.SIGTSTP, save_signal_handler)
         last_count = 0
-        last_export_count = 0
         start_time = time.time()
         with tqdm(total=len(self.traces_to_process), file=sys.stdout, unit='traces') as pbar:
             while process_pool.is_running():
@@ -143,17 +230,11 @@ class Categorizer:
                     last_count = count
                 else:
                     pbar.refresh()
-                if save_switch:
-                    last_export_count = self.generate_report_with_est_from_dispy(process_pool.get_result(),
-                                                                                 last_export_count)
-                    save_switch = False
                 if 0 < timeout < (time.time() - start_time) or kill_switch:
                     process_pool.kill()
                     kill_switch = False
         signal.signal(signal.SIGINT, signal.SIG_DFL)
-        signal.signal(signal.SIGTSTP, signal.SIG_DFL)
-        self.generate_report_with_est_from_dispy(process_pool.get_result(), last_export_count)
-        print(f'\nDone. Total time: {time.time() - start}')
+        print(f'Finished processing the traces in {time.time() - start}s')
 
     def sort_traces(self, strategy: str) -> None:
         """
@@ -179,22 +260,42 @@ class Categorizer:
             return
         raise NotImplementedError(f'{strategy} sort strategy not implemented')
 
-    def generate_report_with_est_from_files(self) -> None:
+    def generate_report_with_est_from_files(self, delete_on_error: bool = False) -> None:
         results = []
         with open(os.path.join(self.output_directory, "processed_traces.json")) as f:
             traces_to_process = json.load(f)
         t = time.time()
+        mean_temp = {}
+        hl = [1, 10, 60, 1800, 3600]
+        for t_ in hl:
+            mean_temp[t_] = []
         for p_trace in traces_to_process:
             if os.path.isfile(os.path.join(self.output_directory, p_trace + '.class.json')):
                 with open(os.path.join(self.output_directory, p_trace + '.class.json')) as f:
                     j = json.load(f)
                     if j['status'] == 'error':
                         print(f'{p_trace} classification failed: {j["message"]}')
+                        if delete_on_error:
+                            os.remove(os.path.join(self.output_directory, p_trace + '.class.json'))
+                            print(f'{p_trace} removed')
                         continue
                     total_io = sum([i['data_operated_avg'] * i['segments_cnt'] for i in (j['read'] + j['write'])])
                     results.append([p_trace,
                                     [class_list for category in j['classes'].values() for class_list in category],
                                     total_io])
+                    for t_ in hl:
+                        t_tot = 0
+                        for temp in j['file_temperatures'][f'{t_}'].values():
+                            t_tot += temp
+                        if hasattr(self, 'traces_of_hash'):
+                            mean_temp[t_].extend(
+                                [t_tot for _ in range(len(self.traces_of_hash[self.get_exec_hash(p_trace)]))])
+                        else:
+                            mean_temp[t_].append(t_tot)
+        with open(os.path.join(self.output_directory, 'heat_distr.json'), 'w') as f:
+            f.write(json.dumps(mean_temp))
+        for t_ in hl:
+            print(f'Temp {t_}s - mean {sum(mean_temp[t_]) / len(mean_temp[t_]):.2f} max {max(mean_temp[t_]):.2f}')
         self.generate_report_with_est(results, len(traces_to_process), len(results))
         print(f'Result exported in {time.time() - t} seconds')
 
@@ -266,10 +367,6 @@ class Categorizer:
                 class_count_all[f'{class_}_distribution'] = round(
                     class_count_all[class_] / estimated_categorized_all_traces, 3)
 
-        generate_box_plots(io_sizes_per_class, self.output_directory)
-
-        generate_class_repartition_wrt_io(io_sizes_per_class, self.output_directory)
-
         class_count_processed = dict(sorted(class_count_processed.items(), key=lambda x: x[0]))
         if estimate:
             class_count_all = dict(sorted(class_count_all.items(), key=lambda x: x[0]))
@@ -277,7 +374,7 @@ class Categorizer:
         with open(os.path.join(self.output_directory, 'summary.json'), "w") as file:
             summary = {
                 'infos': {
-                    'total_traces': len(self.traces),
+                    'total_traces': self.n_traces_in_dir,
                     'processed_traces': n_selected,
                     'canceled_categorizations': n_canceled,
                     'failed_categorizations': failed,
@@ -288,9 +385,15 @@ class Categorizer:
             if hasattr(self, 'traces_of_hash'):
                 summary['classes_estimated_all_jobs'] = class_count_all
                 summary['infos']['inferred_executions'] = estimated_categorized_all_traces
+                if self.n_traces_in_dir != self.n_traces_considered:
+                    summary['infos']['considered_executions'] = self.n_traces_considered
             json.dump(summary, file, indent=4)
+        generate_box_plots(io_sizes_per_class, self.output_directory)
+        generate_class_repartition_wrt_io(io_sizes_per_class, self.output_directory)
+        generate_all_distribution_plots(self.output_directory, estimate)
         traces_of_class = dict(sorted(traces_of_class.items(), key=lambda x: x[0]))
         all_traces = list(set(sum(traces_of_class.values(), [])))
+        generate_all_occurrences_plots(self, traces_of_class, estimate)
         self.generate_heatmaps(traces_of_class, False, False, all_traces)
         if estimate:
             self.generate_heatmaps(traces_of_class, True, False, all_traces, '_estimated_all')
@@ -307,8 +410,8 @@ class Categorizer:
         @param all_traces: list of all categorized traces
         @param suffix: heatmap file suffix
         """
-        jaccard_sim_df = self.compute_jaccard_sim(traces_of_class, estimate_all_traces)
         plt_size = max(5, int(len(traces_of_class) / 1.25))
+        jaccard_sim_df = self.compute_jaccard_sim(traces_of_class, estimate_all_traces)
         plt.figure(figsize=(plt_size, plt_size))
         sns.heatmap(jaccard_sim_df, annot=True, square=True, cmap='Blues')
         plt.tight_layout()
@@ -433,7 +536,23 @@ def compute_trace_hash(trace: str, trace_directory: str) -> (str, str):
     elif trace.endswith('.json.gz'):
         with gzip.open(os.path.join(trace_directory, trace), 'r') as f:
             job = json.load(f)
-    return trace, f'{job["metadata"]["uid"]}{job["metadata"]["exe"]}{len(job["traceEvents"])}'
+    n_bytes = sum([x["args"]["count"] for x in job["traceEvents"] if x["ph"] == "X"])
+    n_bytes = n_bytes - (n_bytes % 1024)
+    return trace, f'{job["metadata"]["uid"]}_{job["metadata"]["exe"]}_{len(job["traceEvents"])}_{n_bytes}'
+
+
+def exec_is_too_short(trace: str, trace_directory: str, threshold: int) -> (str, bool):
+    try:
+        if trace.endswith('.json'):
+            with open(os.path.join(trace_directory, trace), 'r') as f:
+                job = json.load(f)
+        elif trace.endswith('.json.gz'):
+            with gzip.open(os.path.join(trace_directory, trace), 'r') as f:
+                job = json.load(f)
+    except Exception as e:
+        print(f'Error while loading trace {trace}: {e}')
+        raise Exception(f'Error while loading trace {trace}: {e}')
+    return trace, job['metadata']['run_time'] < threshold
 
 
 def categorize_trace(trace: str, output_directory: str, output_graphs: bool, mount: str,
@@ -463,21 +582,45 @@ def categorize_trace(trace: str, output_directory: str, output_graphs: bool, mou
         else:
             raise NotImplementedError(f'Unsupported trace format: {trace}')
         metadata = compute_metadata_stats(job, mount, metadata_spike_threshold)
-        write_segments, write_job = find_periodic_patterns(job, 'write', mount)
-        read_segments, read_job = find_periodic_patterns(job, 'read', mount)
-        total_io = sum([i['metadata_operations_avg'] * i['segments_cnt'] for i in (read_segments + write_segments)])
-        result = {'status': 'success', 'infos': write_job['metadata'], 'classes': None, 'metadata': metadata,
-                  'read': read_segments, 'write': write_segments}
-        classes = classify_trace(result, len(read_segments) > 0, len(write_segments) > 0)
+        file_temperatures = compute_file_temperatures_multiple(job['traceEvents'], [1, 10, 60, 1800, 3600])
+        ftio_data = convert_to_ftio(job)
+        ftio_res = {}
+        ftio_duration = 0
+        if 'write' in ftio_data:
+            start_ts = time.time()
+            period = get_main_frequencies(ftio_data['write'], trace.split('/')[-1])
+            ftio_duration += time.time() - start_ts
+            if period > 0:
+                ftio_res['write'] = period
+        if 'read' in ftio_data:
+            start_ts = time.time()
+            period = get_main_frequencies(ftio_data['read'], trace.split('/')[-1])
+            ftio_duration += time.time() - start_ts
+            if period > 0:
+                ftio_res['read'] = period
+        start_ts = time.time()
+        clustering_write_segments = find_periodic_patterns(job, 'write',
+                                                           mount) if 'write' in ftio_data and 'write' not in ftio_res else []
+        clustering_read_segments = find_periodic_patterns(job, 'read',
+                                                          mount) if 'read' in ftio_data and 'read' not in ftio_res else []
+        clustering_duration = time.time() - start_ts
+        result = {'status': 'success', 'infos': job['metadata'], 'classes': None, 'metadata': metadata,
+                  'read': clustering_read_segments, 'write': clustering_write_segments, 'ftio': ftio_res,
+                  'file_temperatures': file_temperatures,
+                  'debug_durations': {'clustering': clustering_duration, 'ftio': ftio_duration}}
+        classes = classify_trace(job, result)
+        classes['temperatures'] = classify_multiple_temperatures(file_temperatures)
         result['classes'] = classes
-        if output_graphs and (len(write_segments) > 0 or len(read_segments) > 0):
-            visualize(write_job, write_segments, classes['write_classes'], read_job, read_segments,
+        if output_graphs and (len(clustering_write_segments) > 0 or len(clustering_read_segments) > 0):
+            pass
+            visualize(job, clustering_write_segments, classes['write_classes'], clustering_read_segments,
                       classes['read_classes'], os.path.join(output_directory, 'graphs'), mount)
         with open(os.path.join(output_directory, trace.split('/')[-1] + '.class.json'), "w") as file:
             json.dump(result, file, indent=4)
     except Exception as e:
+        sys.stderr.write(f'Error processing {trace}: {str(e)}\n')
         result = {'status': 'error', 'message': str(e)}
         with open(os.path.join(output_directory, trace.split('/')[-1] + '.class.json'), "w") as file:
             json.dump(result, file, indent=4)
         return [f'failed to process {trace}: {e}', [], -1]
-    return [trace, [class_list for category in classes.values() for class_list in category], total_io]
+    return [trace, [class_list for category in classes.values() for class_list in category]]

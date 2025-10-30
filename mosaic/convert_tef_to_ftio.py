@@ -1,5 +1,3 @@
-import gzip
-import json
 import math
 
 import numpy as np
@@ -7,9 +5,12 @@ import numpy as np
 from ftio.cli.ftio_core import core
 from ftio.parse.args import parse_args
 
-def convert_to_ftio (job) -> dict:
-    operations = sorted(list(
-        filter(lambda x: x['name'] in ['read', 'write'], job['traceEvents'])), key=lambda x: x['ts'])
+
+def convert_to_ftio(job) -> dict:
+    operations = sorted(
+        list(filter(lambda x: x['name'] in ['read', 'write'], job['traceEvents'])),
+        key=lambda x: x['ts'],
+    )
 
     if len(operations) < 2:
         return {}
@@ -59,8 +60,9 @@ def convert_to_ftio (job) -> dict:
     ftio_b_r = [0]
     ftio_t_r = [0]
 
-    t_r = [(t, i, 'ts_r') for i, t in enumerate(ts_r)] + \
-          [(t, i, 'te_r') for i, t in enumerate(te_r)]
+    t_r = [(t, i, 'ts_r') for i, t in enumerate(ts_r)] + [
+        (t, i, 'te_r') for i, t in enumerate(te_r)
+    ]
 
     t_r_sorted = sorted(t_r, key=lambda x: x[0])
 
@@ -74,8 +76,9 @@ def convert_to_ftio (job) -> dict:
     ftio_b_w = [0]
     ftio_t_w = [0]
 
-    t_w = [(t, i, 'ts_w') for i, t in enumerate(ts_w)] + \
-          [(t, i, 'te_w') for i, t in enumerate(te_w)]
+    t_w = [(t, i, 'ts_w') for i, t in enumerate(ts_w)] + [
+        (t, i, 'te_w') for i, t in enumerate(te_w)
+    ]
 
     t_w_sorted = sorted(t_w, key=lambda x: x[0])
 
@@ -111,41 +114,27 @@ def convert_to_ftio (job) -> dict:
 
 def get_main_frequencies(data: dict, trace_name: str) -> int:
     ftio_data = {
-        "time": np.array(data['bandwidth']['t_overlap']),
-        "bandwidth": np.array(data['bandwidth']['b_overlap_avr']),
-        "total_bytes": data['total_bytes'],
-        "ranks": data['number_of_ranks']
+        'time': np.array(data['bandwidth']['t_overlap']),
+        'bandwidth': np.array(data['bandwidth']['b_overlap_avr']),
+        'total_bytes': data['total_bytes'],
+        'ranks': data['number_of_ranks'],
     }
-    args = parse_args(['-e', 'no', '-n', '5', '-f', '-1', '--name_debug', trace_name], 'ftio')
-    prediction, dfs = core([ftio_data], args)
-    freqs = list(prediction['dominant_freq'])
-    confs = list(prediction['conf'])
+    args = parse_args(['-e', 'no', '-n', '5', '-f', '-1', '--memory_limit', '1'], 'ftio')
+    prediction, analysis_figures = core(ftio_data, args)
+    freqs, confs = prediction.dominant_freq, prediction.conf
     periods = []
     mean_weighted_period = 0
     for freq in freqs:
         if freq == 0:
-            confs.remove(confs[len(periods)])
+            confs = np.delete(confs, len(periods))
             continue
         period = 1 / freq
-        if period / data['window_duration'] > .5 or confs[len(periods)] < .25:
-            confs.remove(confs[len(periods)])
+        if period / data['window_duration'] > 0.5 or confs[len(periods)] < 0.25:
+            confs = np.delete(confs, len(periods))
             continue
         mean_weighted_period += period * confs[len(periods)]
         periods.append(period)
-    confidence_score = sum(confs)
+    confidence_score = np.sum(confs)
     if confidence_score == 0:
         return -1
     return int(mean_weighted_period / confidence_score)
-
-
-def export_to_file(trace: str) -> None:
-    with gzip.open(trace, 'r') as f:
-        job = json.load(f)
-
-    ftio_data = convert_to_ftio(job)
-
-    with open('/tmp/ftio_read.json', 'w') as f:
-        json.dump(ftio_data['read'], f)
-
-    with open('/tmp/ftio_write.json', 'w') as f:
-        json.dump(ftio_data['write'], f)
