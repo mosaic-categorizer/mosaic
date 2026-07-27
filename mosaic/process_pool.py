@@ -33,7 +33,6 @@ class ProcessPool:
         self._queue_size = queue_size
         self.submit_more_tasks(0)
 
-
     def submit_more_tasks(self, n_done: int):
         if self._queue_size is None:
             return
@@ -67,11 +66,15 @@ class ProcessPool:
     def is_running(self) -> bool:
         if not self._executor._processes:
             return False
-        return len(self._to_process) > 0 or sum([1 if f.done() else 0 for f in self._futures]) < len(self._futures)
+        return len(self._to_process) > 0 or sum(
+            [1 if f.done() else 0 for f in self._futures]
+        ) < len(self._futures)
 
-    def wait_completion(self, unit: str = 'traces', timeout: int = -1) -> None:
+    def wait_completion(self, unit: str = "traces", timeout: int = -1) -> None:
         start_time = time.time()
-        with tqdm(total=len(self._futures) + len(self._to_process), file=sys.stdout, unit=unit) as pbar:
+        with tqdm(
+            total=len(self._futures) + len(self._to_process), file=sys.stdout, unit=unit
+        ) as pbar:
             last_count = 0
             while self.is_running():
                 time.sleep(1)

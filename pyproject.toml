@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=80", "setuptools-scm>=9"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mosaic-categorizer"
+authors = [
+    { name = "Théo Jolivel", email = "theo.jolivel@inria.fr" },
+    { name = "François Tessier" },
+]
+description = "MOSAIC is an automatic I/O patterns categorizer"
+readme = "README.md"
+requires-python = ">=3.10"
+keywords = ["categorizer", "classifier", "pattern"]
+license = "BSD-3-Clause"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Programming Language :: Python :: 3",
+    "Intended Audience :: Science/Research"
+]
+dependencies = [
+    "darshan~=3.5.0",
+    "kaleido~=1.2.0",
+    "matplotlib~=3.10.7",
+    "numpy~=2.2.0",
+    "pandas~=2.3.3",
+    "plotly~=6.5.0",
+    "seaborn~=0.13.2",
+    "scikit-learn~=1.7.2",
+    "tqdm~=4.67.1",
+    "ftio-hpc~=0.0.7",
+    "palettable~=3.3.3",
+]
+dynamic = ["version"]
+
+[tool.setuptools]
+py-modules = []
+ext-modules = [
+    { name = "mosaic.darshanv2logutils", sources = ["mosaic/tef_generators/darshan_python_c_module/darshan-logutils.c", "mosaic/tef_generators/darshan_python_c_module/darshan_logutils_py.c"], libraries = ["z", "bz2"] }
+]
+
+[tool.setuptools_scm]
+
+[tool.setuptools.packages]
+find = {where = ["."]}
+
+[tool.setuptools.package-dir]
+"" = "."

@@ -174,60 +174,62 @@ class FDarshanIndices(Enum):
 
 class DarshanJob(Structure):
     _fields_ = [
-        ('version_string', c_char * 8),
-        ('magic_nr', c_int64),
-        ('uid', c_int64),
-        ('start_time', c_int64),
-        ('end_time', c_int64),
-        ('nprocs', c_int64),
-        ('jobid', c_int64),
-        ('metadata', c_char * 1024),
+        ("version_string", c_char * 8),
+        ("magic_nr", c_int64),
+        ("uid", c_int64),
+        ("start_time", c_int64),
+        ("end_time", c_int64),
+        ("nprocs", c_int64),
+        ("jobid", c_int64),
+        ("metadata", c_char * 1024),
     ]
 
 
 class DarshanFDS(Structure):
     _fields_ = [
-        ('gzf', c_void_p),
-        ('pos', c_int64),
-        ('mode', c_char * 2),
-        ('swap_flag', c_int),
-        ('version', c_char * 10),
-        ('job_struct_size', c_int),
-        ('name', POINTER(c_char)),
-        ('COMPAT_CP_EXE_LEN', c_int),
+        ("gzf", c_void_p),
+        ("pos", c_int64),
+        ("mode", c_char * 2),
+        ("swap_flag", c_int),
+        ("version", c_char * 10),
+        ("job_struct_size", c_int),
+        ("name", POINTER(c_char)),
+        ("COMPAT_CP_EXE_LEN", c_int),
     ]
 
 
 class DarshanFile(Structure):
     _fields_ = [
-        ('hash', c_uint64),
-        ('rank', c_int64),
-        ('name_suffix', c_char * 16),
-        ('counters', c_int64 * 144),
-        ('fcounters', c_double * 18),
+        ("hash", c_uint64),
+        ("rank", c_int64),
+        ("name_suffix", c_char * 16),
+        ("counters", c_int64 * 144),
+        ("fcounters", c_double * 18),
     ]
 
 
-def read_darshan_205(trace: str, mount: str = '/') -> dict:
-    shared_lib_path = os.path.join(pathlib.Path(__file__).parent.resolve(), 'utils/darshan-logutils.so')
+def read_darshan_205(trace: str, mount: str = "/") -> dict:
+    shared_lib_path = os.path.join(
+        pathlib.Path(__file__).parent.resolve(), "utils/darshan-logutils.so"
+    )
 
-    if not trace.endswith('.darshan'):
-        raise Exception('Not a valid darshan trace')
+    if not trace.endswith(".darshan"):
+        raise Exception("Not a valid darshan trace")
 
     if not os.path.isfile(trace):
-        raise Exception('Trace not found')
+        raise Exception("Trace not found")
 
-    with open(trace, 'rb') as f:
-        version = os.pread(f.fileno(), 4, 0).decode('UTF-8')
-        if version != '2.05':
-            raise Exception(f'Unsupported version: {version}')
+    with open(trace, "rb") as f:
+        version = os.pread(f.fileno(), 4, 0).decode("UTF-8")
+        if version != "2.05":
+            raise Exception(f"Unsupported version: {version}")
 
     darshan_df = POINTER(DarshanFDS)
 
     logutils = CDLL(shared_lib_path)
     logutils.darshan_log_open.restype = darshan_df
 
-    fd = logutils.darshan_log_open(trace.encode('UTF-8'), 'r')
+    fd = logutils.darshan_log_open(trace.encode("UTF-8"), "r")
     job = DarshanJob()
     logutils.darshan_log_getjob(fd, byref(job))
 
@@ -238,10 +240,14 @@ def read_darshan_205(trace: str, mount: str = '/') -> dict:
     mnt_pts = POINTER(POINTER(c_char))()
     fs_types = POINTER(POINTER(c_char))()
     mount_count = c_int()
-    logutils.darshan_log_getmounts(fd, byref(devs), byref(mnt_pts), byref(fs_types), byref(mount_count))
+    logutils.darshan_log_getmounts(
+        fd, byref(devs), byref(mnt_pts), byref(fs_types), byref(mount_count)
+    )
     mount_dict = {}
     for i in range(mount_count.value):
-        mount_dict[int(devs[i])] = string_at(mnt_pts[i]).decode('UTF-8'), string_at(fs_types[i]).decode('UTF-8')
+        mount_dict[int(devs[i])] = string_at(mnt_pts[i]).decode("UTF-8"), string_at(
+            fs_types[i]
+        ).decode("UTF-8")
 
     go_next = 1
     darshan_file = DarshanFile()
@@ -253,27 +259,36 @@ def read_darshan_205(trace: str, mount: str = '/') -> dict:
             read = darshan_file.counters[DarshanIndices.CP_BYTES_READ.value]
             write = darshan_file.counters[DarshanIndices.CP_BYTES_WRITTEN.value]
             seeks = darshan_file.counters[DarshanIndices.CP_POSIX_SEEKS.value]
-            if opens == read == write == seeks == 0 or not \
-                    mount_dict[darshan_file.counters[DarshanIndices.CP_DEVICE.value]][0].startswith(mount):
+            if opens == read == write == seeks == 0 or not mount_dict[
+                darshan_file.counters[DarshanIndices.CP_DEVICE.value]
+            ][0].startswith(mount):
                 continue
-            operations.append({
-                'rank': darshan_file.rank,
-                'mount': mount_dict[darshan_file.counters[DarshanIndices.CP_DEVICE.value]][0],
-                'start_ts': darshan_file.fcounters[FDarshanIndices.CP_F_OPEN_TIMESTAMP.value],
-                'end_ts': darshan_file.fcounters[FDarshanIndices.CP_F_CLOSE_TIMESTAMP.value],
-                'opens': opens,
-                'bytes_read': read,
-                'bytes_write': write,
-                'seeks': seeks,
-            })
+            operations.append(
+                {
+                    "rank": darshan_file.rank,
+                    "mount": mount_dict[
+                        darshan_file.counters[DarshanIndices.CP_DEVICE.value]
+                    ][0],
+                    "start_ts": darshan_file.fcounters[
+                        FDarshanIndices.CP_F_OPEN_TIMESTAMP.value
+                    ],
+                    "end_ts": darshan_file.fcounters[
+                        FDarshanIndices.CP_F_CLOSE_TIMESTAMP.value
+                    ],
+                    "opens": opens,
+                    "bytes_read": read,
+                    "bytes_write": write,
+                    "seeks": seeks,
+                }
+            )
     logutils.darshan_log_close(fd)
 
     return {
-        'uid': job.uid,
-        'pid': job.jobid,
-        'nprocs': job.nprocs,
-        'exe': string_at(log_exe.value).decode('UTF-8'),
-        'start_ts': job.start_time,
-        'end_ts': job.end_time,
-        'operations': operations,
+        "uid": job.uid,
+        "pid": job.jobid,
+        "nprocs": job.nprocs,
+        "exe": string_at(log_exe.value).decode("UTF-8"),
+        "start_ts": job.start_time,
+        "end_ts": job.end_time,
+        "operations": operations,
     }
