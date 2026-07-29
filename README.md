@@ -36,7 +36,16 @@ mosaic.generate_traces_from_directory('$DIR_WITH_DARSHAN_FILES', '$OUTPUT_DIR', 
 The third argument allows filtering the I/O operations to only keep those on the PFS.
 For instance, for Polaris, the work PFSs are mounted on `/lus`. Setting the 3rd argument to `/lus` will only keep the I/O operations reading / writing data to the PFSs.
 
-# Categorize TEF traces
+## Merge TEF files from a same job
+
+Multiple Darshan traces can be created for the same job.
+Mosaic can merge them to have a single TEF file per job.
+
+```python
+mosaic.merge_traces_from_same_job('$DIR_TEF_FILES', '$OUTPUT_DIR')
+```
+
+## Categorize TEF traces
 
 ```python
 categorizer = mosaic.Categorizer(trace_directory='$DIR_TEF_FILES', output_directory='$OUT_DIR', mount='$PFS_MOUNT_POINT', prune_executions=False, duration_threshold=60)
