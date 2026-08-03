@@ -468,30 +468,31 @@ def merge_tef_files_same_job(tef_directory: str, out_directory: str):
                 tef = json.load(f)
             shutil.copy(os.path.join(tef_directory, traces_per_job[job][0]),
                         os.path.join(out_directory, get_merged_tef_name(tef)))
-        with gzip.open(os.path.join(tef_directory, traces_per_job[job][0]), "wt") as f:
+            continue
+        with gzip.open(os.path.join(tef_directory, traces_per_job[job][0]), "rt") as f:
             trace = json.load(f)
         metadata = {
             "file": trace["metadata"]["file"],
             "uid": trace["metadata"]["uid"],
-            "job_id": trace["metadata"]["pid"],
+            "job_id": trace["metadata"]["job_id"],
             "start_ts": 0,
             "end_ts": 0,
             "run_time": 0,
             "exe": trace["metadata"]["exe"],
-            "n_nodes": trace["metadata"]["nprocs"],
+            "n_nodes": trace["metadata"]["n_nodes"],
         }
         earliest_start = trace["metadata"]["start_ts"]
         latest_end = trace["metadata"]["end_ts"]
         operations = [op for op in trace["traceEvents"] if op["ph"] in ["M", "X"]]
         for trace_name in traces_per_job[job][1:]:
-            with gzip.open(os.path.join(tef_directory, trace_name), "wt") as f:
+            with gzip.open(os.path.join(tef_directory, trace_name), "rt") as f:
                 trace = json.load(f)
-            if trace["metadata"]["nprocs"] != metadata["n_nodes"]:
+            if trace["metadata"]["n_nodes"] != metadata["n_nodes"]:
                 print("Node count missmatch")
             earliest_start = min(earliest_start, trace["metadata"]["start_ts"])
             latest_end = max(latest_end, trace["metadata"]["end_ts"])
             operations.extend([op for op in trace["traceEvents"] if op["ph"] in ["X"]])
-        operations.sort(key=lambda op: op["ts"])
+        operations.sort(key=lambda op: op["ts"] if "ts" in op else 0)
         operations.append(
             {
                 "name": "Darshan_start",
